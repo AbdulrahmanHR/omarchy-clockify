@@ -1,0 +1,9 @@
+{
+  "plugin.title": "Clockify Control",
+  "status.notConnected": "Not connected",
+  "status.noTimer": "No timer running",
+  "tabs.tracker": "Tracker",
+  "tabs.history": "History",
+  "tabs.manage": "Manage",
+  "tabs.settings": "Settings"
+}

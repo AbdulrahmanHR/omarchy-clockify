@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.abdulrahmanhr.clockify",
+  "name": "Clockify",
+  "version": "1.0.0",
+  "author": "Abdulrahman Rahmouni",
+  "license": "MIT",
+  "description": "Clockify time tracker, analytics dashboard, and workspace controller in the Omarchy bar: start, stop, edit, and discard timers, log manual hours, browse daily/weekly/monthly/yearly charts and project breakdowns, manage projects, tasks, tags, and clients, and run Pomodoro or idle reminders.",
+  "homepage": "https://github.com/AbdulrahmanHR/omarchy-clockify",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Clockify",
+    "description": "Track time, analyze Day/Week/Month/Year reports, edit entries live, manage projects/tasks/tags/clients, and run Pomodoro timers from the bar.",
+    "category": "Time",
+    "aliases": [
+      "clockify",
+      "timer",
+      "time-tracker",
+      "pomodoro"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 45,
+      "hideWhenIdle": false,
+      "showTimerInBar": true,
+      "showTaskInBar": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 45,
+        "description": "How often the bar re-reads Clockify."
+      },
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide when no timer is running",
+        "defaultValue": false,
+        "description": "Keep the widget visible when disconnected so you can connect."
+      },
+      {
+        "key": "showTimerInBar",
+        "type": "boolean",
+        "label": "Show live elapsed timer in bar",
+        "defaultValue": true,
+        "description": "Display H:MM:SS beside the Clockify icon while a timer is running."
+      },
+      {
+        "key": "showTaskInBar",
+        "type": "boolean",
+        "label": "Show running task label in bar",
+        "defaultValue": false,
+        "description": "Include the active task or description in the bar pill."
+      }
+    ]
+  }
+}
