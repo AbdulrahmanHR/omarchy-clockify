@@ -20,7 +20,7 @@ A full-featured [Clockify](https://clockify.me) time tracker, analytics dashboar
 omarchy plugin add https://github.com/AbdulrahmanHR/omarchy-clockify --enable
 ```
 
-Requires only `python3` (shipped with Omarchy) — no external Python packages, no background daemons, and no `sudo` or `pkexec` privileges required.
+Requires only `python3` (shipped with Omarchy) — no external Python packages or background daemons, and runs entirely in user space.
 
 For terminal CLI access outside the bar, you can optionally symlink `clockify.py`:
 

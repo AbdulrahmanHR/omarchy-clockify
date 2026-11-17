@@ -14,6 +14,10 @@ Panel {
   ipcTarget: "io.github.abdulrahmanhr.clockify"
   manageIpc: false
 
+  readonly property string iconGlyph: "󱎫"
+  readonly property bool active: clockify.timing || root.opened
+  readonly property string barTooltip: button.tooltipText
+
   readonly property string helperPath: String(Qt.resolvedUrl("clockify.py")).replace(/^file:\/\//, "")
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color accent: Color.accent
