@@ -257,6 +257,9 @@ class ClockifyHelperTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
                 args = clockify.build_parser().parse_args([
                     "set-config",
+                    "--panel-width", "680",
+                    "--panel-height", "820",
+                    "--wrap-text", "false",
                     "--time-step-min", "15",
                     "--duration-format", "decimal",
                     "--group-similar", "false",
@@ -266,6 +269,9 @@ class ClockifyHelperTests(unittest.TestCase):
                 ])
                 res = clockify.cmd_set_config(args)
                 self.assertTrue(res["ok"])
+                self.assertEqual(res["panelWidth"], 680)
+                self.assertEqual(res["panelHeight"], 820)
+                self.assertFalse(res["wrapText"])
                 self.assertEqual(res["timeStepMinutes"], 15)
                 self.assertEqual(res["durationFormat"], "decimal")
                 self.assertFalse(res["groupSimilarEntries"])
@@ -274,6 +280,9 @@ class ClockifyHelperTests(unittest.TestCase):
                 self.assertEqual(res["weeklyTargetHours"], 32.0)
 
                 saved = json.loads((xdg / "omarchy" / "clockify.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["panelWidth"], 680)
+                self.assertEqual(saved["panelHeight"], 820)
+                self.assertFalse(saved["wrapText"])
                 self.assertEqual(saved["timeStepMinutes"], 15)
                 self.assertEqual(saved["durationFormat"], "decimal")
 

@@ -40,6 +40,9 @@ Item {
   property var defaultTagIds: []
   property bool defaultBillable: false
   property string weekStart: "monday"
+  property int panelWidth: 560
+  property int panelHeight: 740
+  property bool wrapText: true
   property int timeStepMinutes: 5
   property string durationFormat: "compact"
   property bool groupSimilarEntries: true
@@ -361,6 +364,9 @@ Item {
     if (opts.tags !== undefined) cmd.push("--tags", Array.isArray(opts.tags) ? opts.tags.join(",") : String(opts.tags))
     if (opts.billable !== undefined) cmd.push("--billable", opts.billable ? "true" : "false")
     if (opts.weekStart !== undefined) cmd.push("--week-start", String(opts.weekStart))
+    if (opts.panelWidth !== undefined) cmd.push("--panel-width", String(opts.panelWidth))
+    if (opts.panelHeight !== undefined) cmd.push("--panel-height", String(opts.panelHeight))
+    if (opts.wrapText !== undefined) cmd.push("--wrap-text", opts.wrapText ? "true" : "false")
     if (opts.timeStepMinutes !== undefined) cmd.push("--time-step-min", String(opts.timeStepMinutes))
     if (opts.durationFormat !== undefined) cmd.push("--duration-format", String(opts.durationFormat))
     if (opts.groupSimilarEntries !== undefined) cmd.push("--group-similar", opts.groupSimilarEntries ? "true" : "false")
@@ -457,6 +463,9 @@ Item {
     defaultTagIds = Array.isArray(payload.defaultTagIds) ? payload.defaultTagIds : []
     defaultBillable = payload.defaultBillable === true
     weekStart = String(payload.weekStart || "monday")
+    panelWidth = Number(payload.panelWidth || 560)
+    panelHeight = Number(payload.panelHeight || 740)
+    wrapText = payload.wrapText !== false
     timeStepMinutes = Number(payload.timeStepMinutes || 5)
     durationFormat = String(payload.durationFormat || "compact")
     groupSimilarEntries = payload.groupSimilarEntries !== false

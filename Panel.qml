@@ -28,6 +28,8 @@ Panel {
   readonly property bool hideWhenIdle: setting("hideWhenIdle", false) === true
   readonly property bool showTimerInBar: setting("showTimerInBar", true) === true
   readonly property bool showTaskInBar: setting("showTaskInBar", false) === true
+  readonly property int textWrapMode: clockify.wrapText ? Text.Wrap : Text.NoWrap
+  readonly property int textElideMode: clockify.wrapText ? Text.ElideNone : Text.ElideRight
   readonly property bool isPrimaryMonitor: {
     var win = root.QsWindow ? root.QsWindow.window : null
     if (!win || !win.screen || Quickshell.screens.length === 0) return true
@@ -464,8 +466,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(510))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(720))
+    contentWidth: panel.fittedContentWidth(Style.space(clockify.panelWidth))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(clockify.panelHeight))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -546,7 +548,8 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
+              wrapMode: root.textWrapMode
+              elide: root.textElideMode
             }
 
             RowLayout {
@@ -1174,7 +1177,8 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: true
-                  elide: Text.ElideRight
+                  wrapMode: root.textWrapMode
+                  elide: root.textElideMode
                 }
 
                 Button {
@@ -1280,7 +1284,8 @@ Panel {
                       color: root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Math.max(9, Style.font.caption)
-                      elide: Text.ElideRight
+                      wrapMode: root.textWrapMode
+                      elide: root.textElideMode
                     }
 
                     Repeater {
@@ -1470,7 +1475,8 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.bodySmall
                   font.bold: true
-                  elide: Text.ElideRight
+                  wrapMode: root.textWrapMode
+                  elide: root.textElideMode
                 }
 
                 Text {
@@ -1480,7 +1486,8 @@ Panel {
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+                  wrapMode: root.textWrapMode
+                  elide: root.textElideMode
                 }
               }
 
@@ -1974,7 +1981,8 @@ Panel {
                           font.family: root.fontFamily
                           font.pixelSize: Style.font.caption
                           font.bold: bdRow.isActiveFilter
-                          elide: Text.ElideRight
+                          wrapMode: root.textWrapMode
+                          elide: root.textElideMode
                         }
 
                         Text {
@@ -2137,7 +2145,8 @@ Panel {
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.bodySmall
                             font.bold: true
-                            elide: Text.ElideRight
+                            wrapMode: root.textWrapMode
+                            elide: root.textElideMode
                           }
 
                           Text {
@@ -2153,7 +2162,8 @@ Panel {
                             color: root.dim
                             font.family: root.fontFamily
                             font.pixelSize: Style.font.caption
-                            elide: Text.ElideRight
+                            wrapMode: root.textWrapMode
+                            elide: root.textElideMode
                           }
                         }
 
@@ -2264,7 +2274,8 @@ Panel {
                                   color: root.dim
                                   font.family: root.fontFamily
                                   font.pixelSize: Style.font.caption
-                                  elide: Text.ElideRight
+                                  wrapMode: root.textWrapMode
+                                  elide: root.textElideMode
                                 }
 
                                 Text {
@@ -2496,7 +2507,8 @@ Panel {
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
-                    elide: Text.ElideRight
+                    wrapMode: root.textWrapMode
+                    elide: root.textElideMode
                   }
                   Text {
                     textFormat: Text.PlainText
@@ -2630,7 +2642,8 @@ Panel {
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
-                    elide: Text.ElideRight
+                    wrapMode: root.textWrapMode
+                    elide: root.textElideMode
                   }
 
                   PanelActionButton {
@@ -2822,7 +2835,8 @@ Panel {
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
-                    elide: Text.ElideRight
+                    wrapMode: root.textWrapMode
+                    elide: root.textElideMode
                   }
 
                   PanelActionButton {
@@ -2874,6 +2888,88 @@ Panel {
                   root.draftTagIds = []
                   clockify.switchWorkspace(val)
                 }
+              }
+            }
+
+            PanelSectionHeader {
+              text: "DISPLAY & WINDOW"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            ButtonGroup {
+              value: clockify.panelWidth + "x" + clockify.panelHeight
+              foreground: root.foreground
+              background: Color.popups.background
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              options: [
+                { value: "460x640", label: "Compact" },
+                { value: "560x740", label: "Default" },
+                { value: "680x820", label: "Wide" },
+                { value: "800x900", label: "Large" }
+              ]
+              onChanged: function(val) {
+                var parts = String(val).split("x")
+                if (parts.length === 2) {
+                  var w = parseInt(parts[0], 10)
+                  var h = parseInt(parts[1], 10)
+                  clockify.panelWidth = w
+                  clockify.panelHeight = h
+                  clockify.saveConfig({ panelWidth: w, panelHeight: h })
+                }
+              }
+            }
+
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(10)
+
+              NumberField {
+                label: "Width (px)"
+                value: clockify.panelWidth
+                from: 380
+                to: 1000
+                stepSize: 20
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onModified: function(val) {
+                  clockify.panelWidth = val
+                  clockify.saveConfig({ panelWidth: val })
+                }
+              }
+
+              NumberField {
+                label: "Max height (px)"
+                value: clockify.panelHeight
+                from: 420
+                to: 1200
+                stepSize: 20
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onModified: function(val) {
+                  clockify.panelHeight = val
+                  clockify.saveConfig({ panelHeight: val })
+                }
+              }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Wrap long text lines"
+              description: clockify.wrapText
+                ? "Wrap long titles, targets, and metadata onto multiple lines"
+                : "Keep rows compact on one line with ellipsis"
+              checked: clockify.wrapText
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onClicked: {
+                clockify.wrapText = !clockify.wrapText
+                clockify.saveConfig({ wrapText: clockify.wrapText })
               }
             }
 
@@ -3247,7 +3343,8 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
+              wrapMode: root.textWrapMode
+              elide: root.textElideMode
             }
 
             PanelActionButton {
@@ -3597,9 +3694,12 @@ Panel {
     Text {
       textFormat: Text.PlainText
       text: total.value
+      width: parent.width
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.title
+      wrapMode: root.textWrapMode
+      elide: root.textElideMode
     }
 
     Rectangle {
@@ -3633,7 +3733,8 @@ Panel {
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
-      elide: Text.ElideRight
+      wrapMode: root.textWrapMode
+      elide: root.textElideMode
       width: parent.width
     }
   }
@@ -3665,7 +3766,8 @@ Panel {
         font.pixelSize: Math.max(8, Style.font.caption - 1)
         font.bold: true
         font.letterSpacing: 0.8
-        elide: Text.ElideRight
+        wrapMode: root.textWrapMode
+        elide: root.textElideMode
       }
 
       Text {
@@ -3676,7 +3778,8 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         font.bold: true
-        elide: Text.ElideRight
+        wrapMode: root.textWrapMode
+        elide: root.textElideMode
       }
 
       Text {
@@ -3686,7 +3789,8 @@ Panel {
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Math.max(8, Style.font.caption - 1)
-        elide: Text.ElideRight
+        wrapMode: root.textWrapMode
+        elide: root.textElideMode
       }
     }
   }

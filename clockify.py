@@ -818,6 +818,9 @@ def base_payload():
         "defaultTagIds": [],
         "defaultBillable": False,
         "weekStart": "monday",
+        "panelWidth": 560,
+        "panelHeight": 740,
+        "wrapText": True,
         "timeStepMinutes": 5,
         "durationFormat": "compact",
         "groupSimilarEntries": True,
@@ -858,6 +861,9 @@ def _apply_prefs_to_payload(payload, config):
         "defaultTagIds": [str(t) for t in (config.get("defaultTagIds") or []) if t],
         "defaultBillable": _bool_pref(config, "defaultBillable", False),
         "weekStart": _choice_pref(config, "weekStart", ("monday", "sunday"), "monday"),
+        "panelWidth": _int_pref(config, "panelWidth", 560, 380, 1000),
+        "panelHeight": _int_pref(config, "panelHeight", 740, 420, 1200),
+        "wrapText": _bool_pref(config, "wrapText", True),
         "timeStepMinutes": _int_pref(config, "timeStepMinutes", 5, 1, 60),
         "durationFormat": _choice_pref(config, "durationFormat", ("compact", "full", "decimal"), "compact"),
         "groupSimilarEntries": _bool_pref(config, "groupSimilarEntries", True),
@@ -2079,6 +2085,12 @@ def cmd_set_config(args):
         config["workspaceId"] = str(args.workspace).strip()
     if args.week_start is not None:
         config["weekStart"] = str(args.week_start).strip().lower()
+    if args.panel_width is not None:
+        config["panelWidth"] = max(380, min(1000, int(args.panel_width)))
+    if args.panel_height is not None:
+        config["panelHeight"] = max(420, min(1200, int(args.panel_height)))
+    if args.wrap_text is not None:
+        config["wrapText"] = _parse_bool_arg(args.wrap_text)
     if args.time_step_min is not None:
         config["timeStepMinutes"] = max(1, min(60, int(args.time_step_min)))
     if args.duration_format is not None:
@@ -2281,6 +2293,9 @@ def build_parser():
     set_cfg.add_argument("--billable", default=None)
     set_cfg.add_argument("--workspace", default=None)
     set_cfg.add_argument("--week-start", default=None, choices=["monday", "sunday"])
+    set_cfg.add_argument("--panel-width", type=int, default=None)
+    set_cfg.add_argument("--panel-height", type=int, default=None)
+    set_cfg.add_argument("--wrap-text", default=None)
     set_cfg.add_argument("--time-step-min", type=int, default=None)
     set_cfg.add_argument("--duration-format", default=None, choices=["compact", "full", "decimal"])
     set_cfg.add_argument("--group-similar", default=None)
