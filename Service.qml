@@ -70,6 +70,7 @@ Item {
   property bool _bootCachePending: true
   property bool _nextIsCacheOnly: false
   property int _mutationSeq: 0
+  property int _accountSeq: 0
   property var _actionQueue: []
 
   // Idle reminder tracking
@@ -116,6 +117,7 @@ Item {
     if (full === true || (!fullLoaded && configured)) command.push("--full")
     lastRefreshMs = Date.now()
     statusProcess.seqAtStart = root._mutationSeq
+    statusProcess.accountSeqAtStart = root._accountSeq
     statusProcess.command = pythonCommand(command)
     statusProcess.running = true
   }
@@ -124,6 +126,7 @@ Item {
     if (!ready || statusProcess.running || actionProcess.running) return
     _nextIsCacheOnly = true
     statusProcess.seqAtStart = root._mutationSeq
+    statusProcess.accountSeqAtStart = root._accountSeq
     statusProcess.command = pythonCommand([helperPath, "status", "--from-cache"])
     statusProcess.running = true
   }
@@ -415,18 +418,30 @@ Item {
   function saveKey(key) {
     var trimmed = String(key || "").trim()
     if (!ready || trimmed === "" || keyProcess.running) return
+    _mutationSeq += 1
+    _accountSeq += 1
+    _actionQueue = []
+    if (statusProcess.running) statusProcess.running = false
     note = "Validating API key…"
+    keyProcess.accountSeqAtStart = root._accountSeq
     keyProcess.secret = trimmed
     keyProcess.command = pythonCommand([helperPath, "set-key"])
     keyProcess.running = true
   }
 
   function connectDesktop() {
-    runAction([helperPath, "connect-desktop"], true)
+    if (!ready) return
+    _accountSeq += 1
+    _actionQueue = []
+    runAction([helperPath, "connect-desktop"], true, false, false, root._accountSeq)
   }
 
   function clearKey() {
-    runAction([helperPath, "clear-key"], true)
+    if (!ready) return
+    _accountSeq += 1
+    _actionQueue = []
+    note = "Disconnecting…"
+    runAction([helperPath, "clear-key"], true, false, false, root._accountSeq)
   }
 
   function launchDesktopApp() {
@@ -474,6 +489,7 @@ Item {
     actionProcess.expectsSnapshot = item.expectsSnapshot
     actionProcess.isConfigOnly = item.isConfigOnly
     actionProcess.preOptimisticRunning = item.rollbackRunning
+    actionProcess.accountSeqAtStart = item.accountSeq
     actionProcess.command = pythonCommand(item.command)
     actionProcess.running = true
   }
@@ -486,12 +502,13 @@ Item {
     _startActionItem(nextItem)
   }
 
-  function runAction(command, expectsSnapshot, isConfigOnly, rollbackRunning) {
+  function runAction(command, expectsSnapshot, isConfigOnly, rollbackRunning, accountSeqOverride) {
     if (!ready) return
     _mutationSeq += 1
     var expectSnap = expectsSnapshot !== false
     var cfgOnly = isConfigOnly === true
     var rollback = (rollbackRunning && typeof rollbackRunning === "object") ? rollbackRunning : null
+    var acctSeq = (accountSeqOverride !== undefined) ? accountSeqOverride : root._accountSeq
     if (statusProcess.running && !cfgOnly) {
       statusProcess.running = false
     }
@@ -499,7 +516,8 @@ Item {
       command: command,
       expectsSnapshot: expectSnap,
       isConfigOnly: cfgOnly,
-      rollbackRunning: rollback
+      rollbackRunning: rollback,
+      accountSeq: acctSeq
     }
     if (actionProcess.running) {
       var q = _actionQueue.slice()
@@ -725,6 +743,7 @@ Item {
   Process {
     id: statusProcess
     property int seqAtStart: 0
+    property int accountSeqAtStart: 0
     running: false
     command: []
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
@@ -732,7 +751,7 @@ Item {
     onExited: function(exitCode) {
       var wasCacheBoot = root._bootCachePending
       root._bootCachePending = false
-      var stale = (seqAtStart !== root._mutationSeq) || actionProcess.running
+      var stale = (seqAtStart !== root._mutationSeq) || (accountSeqAtStart !== root._accountSeq) || actionProcess.running
       if (!stale) {
         if (exitCode === 0) {
           root.applyPayload(statusOut.text)
@@ -752,6 +771,7 @@ Item {
     property bool expectsSnapshot: true
     property bool isConfigOnly: false
     property var preOptimisticRunning: null
+    property int accountSeqAtStart: 0
     running: false
     command: []
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
@@ -759,6 +779,10 @@ Item {
     onExited: function(exitCode) {
       var rollback = preOptimisticRunning
       preOptimisticRunning = null
+      if (accountSeqAtStart !== root._accountSeq) {
+        root._startNextAction()
+        return
+      }
       if (exitCode !== 0) {
         if (rollback !== null && root.running === null) root.running = rollback
         root.lastError = root.helperFailure(actionErr.text, exitCode)
@@ -785,6 +809,7 @@ Item {
   Process {
     id: keyProcess
     property string secret: ""
+    property int accountSeqAtStart: 0
     running: false
     command: []
     stdinEnabled: true
@@ -796,6 +821,7 @@ Item {
       stdinEnabled = false
     }
     onExited: function(exitCode) {
+      if (accountSeqAtStart !== root._accountSeq) return
       if (exitCode !== 0) {
         root.lastError = root.helperFailure(keyErr.text, exitCode)
         root.keyRejected(root.lastError)

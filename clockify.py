@@ -13,8 +13,11 @@ from __future__ import annotations
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import csv
+import fcntl
 import glob
+import hashlib
 import http.client
 import json
 import os
@@ -24,6 +27,7 @@ import ssl
 import sys
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
@@ -110,46 +114,127 @@ def save_config(config):
     _write_private_json(config_path(), config, indent=2)
 
 
-def load_cache(workspace_id=""):
-    """Read non-sensitive cached workspace/entry metadata for fast startup & deltas."""
+@contextmanager
+def _state_lock():
+    """Serialize config/cache read-modify-write across concurrent helper processes."""
+    lock_path = config_path().with_name("clockify.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _auth_signature(config):
+    """Return a comparable tuple identifying the configured account/auth generation."""
+    if not isinstance(config, dict):
+        return ("", False, "")
+    return (
+        str(config.get("apiKey") or "").strip(),
+        config.get("useDesktopSession") is True,
+        str(config.get("authEpoch") or ""),
+    )
+
+
+def update_config_guarded(expected_auth_sig, updates):
+    """Apply config updates only if the active account/auth state has not changed."""
+    if not updates:
+        return True
+    with _state_lock():
+        latest = load_config()
+        if expected_auth_sig is not None and _auth_signature(latest) != expected_auth_sig:
+            return False
+        changed = False
+        for key, value in updates.items():
+            if latest.get(key) != value:
+                latest[key] = value
+                changed = True
+        if changed:
+            save_config(latest)
+        return True
+
+
+def _credential_fingerprint(cred, auth_source):
+    """Return a one-way SHA-256 scope key for the authenticated credential (never the secret)."""
+    raw = str(cred or "").strip()
+    source = str(auth_source or "").strip()
+    if not raw or not source:
+        return ""
+    if source == "desktop-app":
+        claims = _decode_jwt_claims(raw)
+        uid = str(claims.get("user") or claims.get("sub") or claims.get("userId") or claims.get("email") or "").strip()
+        material = ("desktop-app:user:%s" % uid) if uid else ("desktop-app:tok:%s" % raw)
+    else:
+        material = "%s:%s" % (source, raw)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _active_auth_fingerprint(config=None):
+    cfg = config if isinstance(config, dict) else load_config()
+    cred, _, source = resolve_auth(cfg)
+    return _credential_fingerprint(cred, source)
+
+
+def load_cache(workspace_id="", user_id="", auth_fingerprint=""):
+    """Read non-sensitive cached workspace/entry metadata scoped to user, workspace, and auth."""
     data = _read_json_dict(cache_path())
     if not data or data.get("version") != CACHE_VERSION:
         return {}
     ws = str(workspace_id or "").strip()
     if ws and str(data.get("workspaceId") or "") != ws:
         return {}
+    uid = str(user_id or "").strip()
+    if uid and str(data.get("userId") or "") != uid:
+        return {}
+    fp = str(auth_fingerprint or "").strip()
+    if fp and str(data.get("authFingerprint") or "") != fp:
+        return {}
     return data
 
 
-def save_cache(payload):
+def save_cache(payload, expected_auth_sig=None, auth_fingerprint=""):
     """Persist only non-sensitive workspace metadata and history entries (never credentials)."""
     ws_id = str(payload.get("workspaceId") or "").strip()
-    if not payload.get("configured") or not ws_id or not payload.get("userId"):
+    user_id = str(payload.get("userId") or "").strip()
+    if not payload.get("configured") or not ws_id or not user_id:
         return
-    existing = load_cache(ws_id)
-    now_iso = utc_stamp(now_utc())
-    is_full = bool(payload.get("fullLoaded"))
-    safe_cache = {
-        "version": CACHE_VERSION,
-        "userId": str(payload.get("userId") or ""),
-        "userName": str(payload.get("userName") or ""),
-        "userEmail": str(payload.get("userEmail") or ""),
-        "workspaceId": ws_id,
-        "workspaceName": str(payload.get("workspaceName") or existing.get("workspaceName") or ""),
-        "workspaces": payload.get("workspaces") if is_full else (existing.get("workspaces") or []),
-        "projects": payload.get("projects") if is_full else (existing.get("projects") or []),
-        "tags": payload.get("tags") if is_full else (existing.get("tags") or []),
-        "clients": payload.get("clients") if is_full else (existing.get("clients") or []),
-        "recentEntries": list(payload.get("recentEntries") or [])[:MAX_RECENT_ENTRIES],
-        "loadedStartDate": str(payload.get("loadedStartDate") or existing.get("loadedStartDate") or ""),
-        "loadedEndDate": str(payload.get("loadedEndDate") or existing.get("loadedEndDate") or ""),
-        "updatedAt": now_iso,
-        "fullLoadedAt": now_iso if is_full else str(existing.get("fullLoadedAt") or ""),
-    }
-    try:
-        _write_private_json(cache_path(), safe_cache, indent=None)
-    except OSError:
-        pass
+    with _state_lock():
+        latest_config = load_config()
+        if expected_auth_sig is not None and _auth_signature(latest_config) != expected_auth_sig:
+            return
+        fp = str(auth_fingerprint or "").strip() or _active_auth_fingerprint(latest_config)
+        if not fp:
+            return
+        existing = load_cache(ws_id, user_id=user_id, auth_fingerprint=fp)
+        now_iso = utc_stamp(now_utc())
+        is_full = bool(payload.get("fullLoaded"))
+        safe_cache = {
+            "version": CACHE_VERSION,
+            "authFingerprint": fp,
+            "userId": user_id,
+            "userName": str(payload.get("userName") or ""),
+            "userEmail": str(payload.get("userEmail") or ""),
+            "workspaceId": ws_id,
+            "workspaceName": str(payload.get("workspaceName") or existing.get("workspaceName") or ""),
+            "workspaces": payload.get("workspaces") if is_full else (existing.get("workspaces") or []),
+            "projects": payload.get("projects") if is_full else (existing.get("projects") or []),
+            "tags": payload.get("tags") if is_full else (existing.get("tags") or []),
+            "clients": payload.get("clients") if is_full else (existing.get("clients") or []),
+            "recentEntries": list(payload.get("recentEntries") or [])[:MAX_RECENT_ENTRIES],
+            "loadedStartDate": str(payload.get("loadedStartDate") or existing.get("loadedStartDate") or ""),
+            "loadedEndDate": str(payload.get("loadedEndDate") or existing.get("loadedEndDate") or ""),
+            "updatedAt": now_iso,
+            "fullLoadedAt": now_iso if is_full else str(existing.get("fullLoadedAt") or ""),
+        }
+        try:
+            _write_private_json(cache_path(), safe_cache, indent=None)
+        except OSError:
+            pass
 
 
 def clear_cache():
@@ -391,6 +476,11 @@ class Api:
         self.connection = None
 
     def call(self, method, path, body=None, params=None):
+        http_method = str(method or "").strip().upper()
+        if self.auth_source == "desktop-app" and http_method not in ("GET", "HEAD", "OPTIONS"):
+            raise ApiError(
+                "Clockify Desktop session is read-only. Add a personal API key in Settings to start, stop, or edit entries."
+            )
         target = API_PATH + path
         if params:
             target += "?" + urllib.parse.urlencode(params)
@@ -588,16 +678,18 @@ def identity(config, api):
 def fast_identity(config, api, force_network=False):
     """Reuse cached user/workspace ids when available to avoid an extra /user round-trip."""
     if not force_network:
-        cache = load_cache()
-        ws_id = str(config.get("workspaceId") or cache.get("workspaceId") or "")
-        user_id = str(cache.get("userId") or "")
-        if user_id and ws_id and str(cache.get("workspaceId") or "") == ws_id:
-            return Identity(
-                user_id,
-                ws_id,
-                str(cache.get("userName") or ""),
-                str(cache.get("userEmail") or ""),
-            )
+        auth_fp = _credential_fingerprint(api.credential, api.auth_source)
+        if auth_fp:
+            cache = load_cache(auth_fingerprint=auth_fp)
+            ws_id = str(config.get("workspaceId") or cache.get("workspaceId") or "")
+            user_id = str(cache.get("userId") or "")
+            if user_id and ws_id and str(cache.get("workspaceId") or "") == ws_id:
+                return Identity(
+                    user_id,
+                    ws_id,
+                    str(cache.get("userName") or ""),
+                    str(cache.get("userEmail") or ""),
+                )
     return identity(config, api)
 
 
@@ -942,13 +1034,15 @@ def _dedupe_sort_entries(entries, today_date):
 
 
 def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_date="", use_cache=True):
-    cache = load_cache(ident.workspace_id) if (use_cache and ident.workspace_id) else {}
+    expected_auth_sig = _auth_signature(config)
+    auth_fp = _credential_fingerprint(api.credential, auth_source or api.auth_source)
+    cache = load_cache(ident.workspace_id, user_id=ident.user_id, auth_fingerprint=auth_fp) if (use_cache and ident.workspace_id and ident.user_id and auth_fp) else {}
     local_tz = datetime.now().astimezone().tzinfo
     today_date = datetime.now().astimezone().date()
     moment = now_utc()
     if ident.week_start and "weekStart" not in config:
         config["weekStart"] = ident.week_start
-        save_config(config)
+        update_config_guarded(expected_auth_sig, {"weekStart": ident.week_start})
     first_day = str(config.get("weekStart") or ident.week_start or "monday")
     week_floor = week_start(moment, first_day)
     month_floor = local_midnight(moment).replace(day=1)
@@ -1090,7 +1184,7 @@ def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_
         "fetchedAt": utc_stamp(moment),
     })
     if use_cache and not is_custom_range:
-        save_cache(payload)
+        save_cache(payload, expected_auth_sig=expected_auth_sig, auth_fingerprint=auth_fp)
     return payload
 
 
@@ -1107,7 +1201,9 @@ def fast_mutation_snapshot(
     deleted_ids=None,
 ):
     """Apply a mutation directly onto warm cache; fall back to snapshot() on cold cache."""
-    cache = load_cache(ident.workspace_id)
+    expected_auth_sig = _auth_signature(config)
+    auth_fp = _credential_fingerprint(api.credential, auth_source or api.auth_source)
+    cache = load_cache(ident.workspace_id, user_id=ident.user_id, auth_fingerprint=auth_fp) if (ident.workspace_id and ident.user_id and auth_fp) else {}
     if not cache or not cache.get("loadedStartDate"):
         return snapshot(config, api, ident, auth_source=auth_source)
 
@@ -1163,7 +1259,7 @@ def fast_mutation_snapshot(
         "fullLoaded": False,
         "fetchedAt": utc_stamp(moment),
     })
-    save_cache(payload)
+    save_cache(payload, expected_auth_sig=expected_auth_sig, auth_fingerprint=auth_fp)
     return payload
 
 
@@ -1204,7 +1300,7 @@ def remember_host(config, api):
     host = str(api.good_host or "")
     if host and host != str(config.get("apiHost") or ""):
         config["apiHost"] = host
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"apiHost": host})
 
 
 def unconfigured(config, note=""):
@@ -1214,9 +1310,12 @@ def unconfigured(config, note=""):
     return payload
 
 
-def _payload_from_cache(config, cred_source):
+def _payload_from_cache(config, cred_source, auth_fingerprint=""):
     ws_id = str(config.get("workspaceId") or "").strip()
-    cache = load_cache(ws_id)
+    fp = str(auth_fingerprint or "").strip() or _active_auth_fingerprint(config)
+    if not fp:
+        return None
+    cache = load_cache(ws_id, auth_fingerprint=fp)
     if not cache or not cache.get("userId") or not cache.get("workspaceId"):
         return None
     today_date = datetime.now().astimezone().date()
@@ -1261,7 +1360,7 @@ def cmd_status(args):
         cred, _, source = resolve_auth(config)
         if not cred:
             return unconfigured(config)
-        cached_payload = _payload_from_cache(config, source)
+        cached_payload = _payload_from_cache(config, source, _credential_fingerprint(cred, source))
         if cached_payload is not None:
             return cached_payload
     api, ident, source = open_client(config, force_identity=bool(args.full))
@@ -1405,19 +1504,20 @@ def cmd_start(args):
 
     created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
 
-    changed = False
+    updates = {}
     if args.project is not None and project_id != str(config.get("defaultProjectId") or ""):
         config["defaultProjectId"] = project_id
+        updates["defaultProjectId"] = project_id
         if not project_id:
             config["defaultTaskId"] = ""
-        changed = True
+            updates["defaultTaskId"] = ""
     if args.task is not None:
         tid = str(args.task).strip() if project_id else ""
         if tid != str(config.get("defaultTaskId") or ""):
             config["defaultTaskId"] = tid
-            changed = True
-    if changed:
-        save_config(config)
+            updates["defaultTaskId"] = tid
+    if updates:
+        update_config_guarded(_auth_signature(config), updates)
 
     payload = fast_mutation_snapshot(
         config,
@@ -1785,7 +1885,7 @@ def cmd_create_project(args):
     if created.get("id"):
         config["defaultProjectId"] = str(created["id"])
         config["defaultTaskId"] = ""
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"defaultProjectId": config["defaultProjectId"], "defaultTaskId": ""})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Project created: %s" % name
     remember_host(config, api)
@@ -1815,7 +1915,7 @@ def cmd_archive_project(args):
     if archived and proj_id == str(config.get("defaultProjectId") or ""):
         config["defaultProjectId"] = ""
         config["defaultTaskId"] = ""
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"defaultProjectId": "", "defaultTaskId": ""})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Project archived" if archived else "Project restored"
     remember_host(config, api)
@@ -1851,7 +1951,7 @@ def cmd_delete_project(args):
     if proj_id == str(config.get("defaultProjectId") or ""):
         config["defaultProjectId"] = ""
         config["defaultTaskId"] = ""
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"defaultProjectId": "", "defaultTaskId": ""})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Project deleted"
     remember_host(config, api)
@@ -1877,7 +1977,7 @@ def cmd_create_task(args):
     if created.get("id"):
         config["defaultProjectId"] = project_id
         config["defaultTaskId"] = str(created["id"])
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"defaultProjectId": project_id, "defaultTaskId": config["defaultTaskId"]})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Task created: %s" % name
     remember_host(config, api)
@@ -1913,7 +2013,7 @@ def cmd_delete_task(args):
     api.call("DELETE", "/workspaces/%s/projects/%s/tasks/%s" % (ident.workspace_id, proj_id, task_id))
     if task_id == str(config.get("defaultTaskId") or ""):
         config["defaultTaskId"] = ""
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"defaultTaskId": ""})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Task deleted"
     remember_host(config, api)
@@ -1945,7 +2045,7 @@ def cmd_delete_tag(args):
     default_tags = [str(t) for t in (config.get("defaultTagIds") or []) if str(t) != tag_id]
     if default_tags != (config.get("defaultTagIds") or []):
         config["defaultTagIds"] = default_tags
-        save_config(config)
+        update_config_guarded(_auth_signature(config), {"defaultTagIds": default_tags})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Tag deleted"
     remember_host(config, api)
@@ -1981,16 +2081,17 @@ def cmd_delete_client(args):
 
 
 def cmd_switch_workspace(args):
-    config = load_config()
     ws_id = str(args.workspace or "").strip()
     if not ws_id:
         raise ApiError("Workspace id cannot be empty")
-    config["workspaceId"] = ws_id
-    config["defaultProjectId"] = ""
-    config["defaultTaskId"] = ""
-    config["defaultTagIds"] = []
-    save_config(config)
-    clear_cache()
+    with _state_lock():
+        config = load_config()
+        config["workspaceId"] = ws_id
+        config["defaultProjectId"] = ""
+        config["defaultTaskId"] = ""
+        config["defaultTagIds"] = []
+        save_config(config)
+        clear_cache()
 
     api, ident, source = open_client(config, force_identity=True)
     if not api:
@@ -2009,18 +2110,21 @@ def cmd_set_key(args):
         payload["error"] = "No API key received"
         return payload
 
-    config = load_config()
-    api = Api(key, "X-Api-Key", str(config.get("apiHost") or ""), auth_source="api-key", config=config)
+    initial_cfg = load_config()
+    api = Api(key, "X-Api-Key", str(initial_cfg.get("apiHost") or ""), auth_source="api-key", config=initial_cfg)
     ident = identity({}, api)
-    config["apiKey"] = key
-    config.pop("useDesktopSession", None)
-    config.pop("desktopAccessToken", None)
-    config.pop("desktopRefreshToken", None)
-    config["workspaceId"] = ident.workspace_id
-    if ident.week_start and "weekStart" not in config:
-        config["weekStart"] = ident.week_start
-    save_config(config)
-    clear_cache()
+    with _state_lock():
+        config = load_config()
+        config["apiKey"] = key
+        config.pop("useDesktopSession", None)
+        config.pop("desktopAccessToken", None)
+        config.pop("desktopRefreshToken", None)
+        config["authEpoch"] = uuid.uuid4().hex
+        config["workspaceId"] = ident.workspace_id
+        if ident.week_start and "weekStart" not in config:
+            config["weekStart"] = ident.week_start
+        save_config(config)
+        clear_cache()
 
     payload = snapshot(config, api, ident, full=True, auth_source="api-key")
     payload["note"] = "Connected via API key as %s" % (ident.user_name or "Clockify user")
@@ -2033,18 +2137,21 @@ def cmd_connect_desktop(args):
     if not tok:
         raise ApiError("No active Clockify Desktop session found. Sign in to Clockify Desktop first or paste an API key.")
 
-    config = load_config()
-    api = Api(tok, "X-Auth-Token", str(config.get("apiHost") or ""), auth_source="desktop-app", config=config)
+    initial_cfg = load_config()
+    api = Api(tok, "X-Auth-Token", str(initial_cfg.get("apiHost") or ""), auth_source="desktop-app", config=initial_cfg)
     ident = identity({}, api)
-    config["useDesktopSession"] = True
-    config.pop("apiKey", None)
-    config.pop("desktopAccessToken", None)
-    config.pop("desktopRefreshToken", None)
-    config["workspaceId"] = ident.workspace_id
-    if ident.week_start and "weekStart" not in config:
-        config["weekStart"] = ident.week_start
-    save_config(config)
-    clear_cache()
+    with _state_lock():
+        config = load_config()
+        config["useDesktopSession"] = True
+        config.pop("apiKey", None)
+        config.pop("desktopAccessToken", None)
+        config.pop("desktopRefreshToken", None)
+        config["authEpoch"] = uuid.uuid4().hex
+        config["workspaceId"] = ident.workspace_id
+        if ident.week_start and "weekStart" not in config:
+            config["weekStart"] = ident.week_start
+        save_config(config)
+        clear_cache()
 
     payload = snapshot(config, api, ident, full=True, auth_source="desktop-app")
     payload["note"] = "Connected to Clockify Desktop session"
@@ -2053,13 +2160,15 @@ def cmd_connect_desktop(args):
 
 
 def cmd_clear_key(args):
-    config = load_config()
-    config.pop("apiKey", None)
-    config.pop("useDesktopSession", None)
-    config.pop("desktopAccessToken", None)
-    config.pop("desktopRefreshToken", None)
-    save_config(config)
-    clear_cache()
+    with _state_lock():
+        config = load_config()
+        config.pop("apiKey", None)
+        config.pop("useDesktopSession", None)
+        config.pop("desktopAccessToken", None)
+        config.pop("desktopRefreshToken", None)
+        config["authEpoch"] = uuid.uuid4().hex
+        save_config(config)
+        clear_cache()
     return unconfigured(config, note="Disconnected")
 
 
@@ -2075,57 +2184,58 @@ def _parse_bool_arg(val):
 
 
 def cmd_set_config(args):
-    config = load_config()
-    if args.project is not None:
-        config["defaultProjectId"] = str(args.project).strip()
-        if not config["defaultProjectId"]:
-            config["defaultTaskId"] = ""
-    if args.task is not None:
-        config["defaultTaskId"] = str(args.task).strip()
-    if args.tags is not None:
-        config["defaultTagIds"] = _parse_tag_csv(args.tags) or []
-    if args.billable is not None:
-        config["defaultBillable"] = _parse_bool_arg(args.billable)
-    if args.workspace is not None:
-        config["workspaceId"] = str(args.workspace).strip()
-    if args.week_start is not None:
-        config["weekStart"] = str(args.week_start).strip().lower()
-    if args.panel_width is not None:
-        config["panelWidth"] = max(380, min(1000, int(args.panel_width)))
-    if args.panel_height is not None:
-        config["panelHeight"] = max(420, min(1200, int(args.panel_height)))
-    if args.wrap_text is not None:
-        config["wrapText"] = _parse_bool_arg(args.wrap_text)
-    if args.time_step_min is not None:
-        config["timeStepMinutes"] = max(1, min(60, int(args.time_step_min)))
-    if args.quick_step_min is not None:
-        config["quickStepMinutes"] = max(1, min(60, int(args.quick_step_min)))
-    if args.duration_format is not None:
-        config["durationFormat"] = str(args.duration_format).strip().lower()
-    if args.group_similar is not None:
-        config["groupSimilarEntries"] = _parse_bool_arg(args.group_similar)
-    if args.pomodoro is not None:
-        config["pomodoroEnabled"] = _parse_bool_arg(args.pomodoro)
-    if args.pomodoro_auto_timer is not None:
-        config["pomodoroAutoTimer"] = _parse_bool_arg(args.pomodoro_auto_timer)
-    if args.pomodoro_work is not None:
-        config["pomodoroWorkMin"] = max(1, min(180, int(args.pomodoro_work)))
-    if args.pomodoro_break is not None:
-        config["pomodoroBreakMin"] = max(1, min(60, int(args.pomodoro_break)))
-    if args.daily_target_hours is not None:
-        config["dailyTargetHours"] = round(max(0.0, min(24.0, float(args.daily_target_hours))), 2)
-    if args.weekly_target_hours is not None:
-        config["weeklyTargetHours"] = round(max(0.0, min(168.0, float(args.weekly_target_hours))), 2)
-    if args.stop_on_idle is not None:
-        config["stopOnIdle"] = _parse_bool_arg(args.stop_on_idle)
-    if args.idle_stop_min is not None:
-        config["idleStopMin"] = max(5, min(1440, int(args.idle_stop_min)))
-    if args.remind_when_idle is not None:
-        config["remindWhenIdle"] = _parse_bool_arg(args.remind_when_idle)
-    if args.idle_remind_min is not None:
-        config["idleRemindMin"] = max(5, min(480, int(args.idle_remind_min)))
+    with _state_lock():
+        config = load_config()
+        if args.project is not None:
+            config["defaultProjectId"] = str(args.project).strip()
+            if not config["defaultProjectId"]:
+                config["defaultTaskId"] = ""
+        if args.task is not None:
+            config["defaultTaskId"] = str(args.task).strip()
+        if args.tags is not None:
+            config["defaultTagIds"] = _parse_tag_csv(args.tags) or []
+        if args.billable is not None:
+            config["defaultBillable"] = _parse_bool_arg(args.billable)
+        if args.workspace is not None:
+            config["workspaceId"] = str(args.workspace).strip()
+        if args.week_start is not None:
+            config["weekStart"] = str(args.week_start).strip().lower()
+        if args.panel_width is not None:
+            config["panelWidth"] = max(380, min(1000, int(args.panel_width)))
+        if args.panel_height is not None:
+            config["panelHeight"] = max(420, min(1200, int(args.panel_height)))
+        if args.wrap_text is not None:
+            config["wrapText"] = _parse_bool_arg(args.wrap_text)
+        if args.time_step_min is not None:
+            config["timeStepMinutes"] = max(1, min(60, int(args.time_step_min)))
+        if args.quick_step_min is not None:
+            config["quickStepMinutes"] = max(1, min(60, int(args.quick_step_min)))
+        if args.duration_format is not None:
+            config["durationFormat"] = str(args.duration_format).strip().lower()
+        if args.group_similar is not None:
+            config["groupSimilarEntries"] = _parse_bool_arg(args.group_similar)
+        if args.pomodoro is not None:
+            config["pomodoroEnabled"] = _parse_bool_arg(args.pomodoro)
+        if args.pomodoro_auto_timer is not None:
+            config["pomodoroAutoTimer"] = _parse_bool_arg(args.pomodoro_auto_timer)
+        if args.pomodoro_work is not None:
+            config["pomodoroWorkMin"] = max(1, min(180, int(args.pomodoro_work)))
+        if args.pomodoro_break is not None:
+            config["pomodoroBreakMin"] = max(1, min(60, int(args.pomodoro_break)))
+        if args.daily_target_hours is not None:
+            config["dailyTargetHours"] = round(max(0.0, min(24.0, float(args.daily_target_hours))), 2)
+        if args.weekly_target_hours is not None:
+            config["weeklyTargetHours"] = round(max(0.0, min(168.0, float(args.weekly_target_hours))), 2)
+        if args.stop_on_idle is not None:
+            config["stopOnIdle"] = _parse_bool_arg(args.stop_on_idle)
+        if args.idle_stop_min is not None:
+            config["idleStopMin"] = max(5, min(1440, int(args.idle_stop_min)))
+        if args.remind_when_idle is not None:
+            config["remindWhenIdle"] = _parse_bool_arg(args.remind_when_idle)
+        if args.idle_remind_min is not None:
+            config["idleRemindMin"] = max(5, min(480, int(args.idle_remind_min)))
 
-    save_config(config)
+        save_config(config)
     payload = base_payload()
     _apply_prefs_to_payload(payload, config)
     payload["note"] = "Preferences saved"

@@ -476,6 +476,101 @@ class AuthIsolationTests(unittest.TestCase):
             self.assertNotIn("desktopRefreshToken", saved)
             self.assertEqual(saved.get("weekStart"), "monday")
 
+    def test_in_flight_status_cannot_undo_disconnect(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text(
+                json.dumps({"apiKey": "key-user-1", "workspaceId": "w1", "authEpoch": "e1"}),
+                encoding="utf-8",
+            )
+            cache_file = xdg / "omarchy" / "clockify-cache.json"
+            ident = clockify.Identity("u1", "w1", "Tester", week_start="sunday")
+            api = mock.MagicMock()
+            api.credential = "key-user-1"
+            api.auth_source = "api-key"
+            api.good_host = "1.2.3.4"
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                stale_cfg = clockify.load_config()
+
+                def disconnect_mid_flight(*_args, **_kwargs):
+                    clockify.cmd_clear_key(clockify.build_parser().parse_args(["clear-key"]))
+                    return []
+
+                with mock.patch.object(clockify, "time_entries", side_effect=disconnect_mid_flight):
+                    clockify.snapshot(stale_cfg, api, ident, full=False, auth_source="api-key")
+                clockify.remember_host(stale_cfg, api)
+
+            saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+            self.assertNotIn("apiKey", saved)
+            self.assertNotIn("useDesktopSession", saved)
+            self.assertNotIn("apiHost", saved)
+            self.assertFalse(cache_file.exists())
+
+            # Also verify weekStart / config update is rejected if disconnect happened before snapshot().
+            self.assertFalse(
+                clockify.update_config_guarded(clockify._auth_signature(stale_cfg), {"weekStart": "monday"})
+            )
+            saved_after = json.loads(cfg_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved_after.get("weekStart"), "sunday")
+
+    def test_cached_history_is_isolated_across_external_credential_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text(json.dumps({"apiKey": "key-user-a", "workspaceId": "w1"}), encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                clockify.save_cache({
+                    "configured": True,
+                    "userId": "user-a",
+                    "userName": "User A",
+                    "workspaceId": "w1",
+                    "workspaceName": "Shared WS",
+                    "recentEntries": [{
+                        "id": "e-a1",
+                        "description": "User A secret work",
+                        "start": "2026-11-17T08:00:00Z",
+                        "end": "2026-11-17T09:00:00Z",
+                        "seconds": 3600,
+                        "dateIso": "2026-11-17",
+                    }],
+                    "loadedStartDate": "2026-11-01",
+                    "loadedEndDate": "2026-11-17",
+                    "fullLoaded": True,
+                })
+
+                # Externally switch credential to User B in the same workspace w1.
+                cfg_file.write_text(json.dumps({"apiKey": "key-user-b", "workspaceId": "w1"}), encoding="utf-8")
+
+                # 1. Startup cache path must not serve User A's cache.
+                self.assertIsNone(clockify._payload_from_cache(clockify.load_config(), "api-key"))
+
+                # 2. fast_identity must not reuse User A's userId.
+                api_b = mock.MagicMock()
+                api_b.credential = "key-user-b"
+                api_b.auth_source = "api-key"
+                ident_b = clockify.Identity("user-b", "w1", "User B")
+                with mock.patch.object(clockify, "identity", return_value=ident_b) as mock_id:
+                    resolved = clockify.fast_identity(clockify.load_config(), api_b, force_network=False)
+                mock_id.assert_called_once()
+                self.assertEqual(resolved.user_id, "user-b")
+
+                # 3. snapshot (and export-csv) must not merge User A's cached entries.
+                with mock.patch.object(clockify, "time_entries", return_value=[]):
+                    snap_b = clockify.snapshot(clockify.load_config(), api_b, ident_b, full=False, auth_source="api-key")
+                self.assertEqual(snap_b["recentEntries"], [])
+
+    def test_desktop_session_enforces_read_only_at_api_boundary(self):
+        api_ro = clockify.Api("jwt-tok", "X-Auth-Token", auth_source="desktop-app", addresses=[])
+        for method in ("POST", "PUT", "PATCH", "DELETE"):
+            with self.assertRaises(clockify.ApiError) as ctx:
+                api_ro.call(method, "/workspaces/w1/time-entries", body={"start": "2026-11-17T08:00:00Z"})
+            self.assertIn("read-only", str(ctx.exception).lower())
+
 
 if __name__ == "__main__":
     unittest.main()
