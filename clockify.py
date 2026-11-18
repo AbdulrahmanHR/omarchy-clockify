@@ -4,8 +4,8 @@
 Every subcommand prints exactly one JSON object on stdout and exits 0 so the
 QML layer has a single structured shape to parse. Credentials are never passed
 via argv; they are read from ~/.config/omarchy/clockify.json (mode 0600),
-$CLOCKIFY_API_KEY, ~/.config/clockify-cli/config.yaml, stdin (for set-key),
-or auto-discovered from the logged-in Clockify Desktop session.
+$CLOCKIFY_API_KEY, stdin (for set-key), or read-only from Clockify Desktop's
+active access session only after explicit user opt-in via connect-desktop.
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ from pathlib import Path
 from time import monotonic
 
 HOST = "api.clockify.me"
-GLOBAL_HOST = "global.api.clockify.me"
 API_PATH = "/api/v1"
 USER_AGENT = "omarchy-clockify/1.0"
 TIMEOUT = 6
 DEADLINE = 26
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 PAGE_SIZE = 200
 PAGE_LIMIT = 5
 MAX_ENTRY_DAYS = 365
@@ -68,11 +68,6 @@ def config_path():
 def clockify_desktop_leveldb_dir():
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "Clockify" / "Local Storage" / "leveldb"
-
-
-def clockify_cli_config_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "clockify-cli" / "config.yaml"
 
 
 def load_config():
@@ -204,111 +199,53 @@ def _decode_jwt_claims(token):
         return None
 
 
-def _discover_desktop_tokens(config):
-    """Find newest access and refresh JWTs from Clockify Desktop or cache."""
+def _discover_desktop_access_token():
+    """Find newest active access JWT in Clockify Desktop storage (read-only, in memory)."""
     access_candidates = []
-    refresh_candidates = []
-
-    def add_candidate(tok):
-        claims = _decode_jwt_claims(tok)
-        if not claims:
-            return
-        typ = str(claims.get("type") or "")
-        iat = int(claims.get("iat") or 0)
-        exp = int(claims.get("exp") or 0)
-        if typ == "access":
-            access_candidates.append((iat, exp, tok))
-        elif typ == "refresh":
-            refresh_candidates.append((iat, exp, tok))
-
-    for cached_key in ("desktopAccessToken", "desktopRefreshToken"):
-        val = str(config.get(cached_key) or "").strip()
-        if val:
-            add_candidate(val)
+    now_ts = time.time()
 
     ldb_dir = clockify_desktop_leveldb_dir()
-    if ldb_dir.is_dir():
-        jwt_re = re.compile(rb"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
-        for fn in sorted(glob.glob(str(ldb_dir / "*"))):
-            if not (fn.endswith(".ldb") or fn.endswith(".log")):
-                continue
-            try:
-                raw = Path(fn).read_bytes()
-            except OSError:
-                continue
-            blobs = [raw]
-            if fn.endswith(".ldb"):
-                blobs.append(_read_ldb_blocks(raw))
-            for blob in blobs:
-                for m in jwt_re.finditer(blob):
-                    add_candidate(m.group(0).decode("ascii", "ignore"))
-
-    access_candidates.sort(key=lambda item: item[0])
-    refresh_candidates.sort(key=lambda item: item[0])
-    best_access = access_candidates[-1] if access_candidates else None
-    best_refresh = refresh_candidates[-1] if refresh_candidates else None
-    return best_access, best_refresh
-
-
-def _refresh_desktop_token(refresh_token):
-    conn = http.client.HTTPSConnection(GLOBAL_HOST, 443, timeout=TIMEOUT)
-    try:
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": USER_AGENT,
-        }
-        conn.request("POST", "/auth/token/refresh", json.dumps({"refreshToken": refresh_token}).encode("utf-8"), headers)
-        resp = conn.getresponse()
-        raw = resp.read().decode("utf-8", "replace")
-        if resp.status >= 400:
-            raise ApiError(status_message(resp.status, raw), resp.status)
-        data = json.loads(raw)
-        tok = str(data.get("token") or "").strip()
-        rtok = str(data.get("refreshToken") or refresh_token).strip()
-        if not tok:
-            raise ApiError("Clockify refresh returned no token")
-        return tok, rtok
-    except (OSError, http.client.HTTPException, ValueError) as exc:
-        raise ApiError("Could not refresh Clockify Desktop session: %s" % exc) from exc
-    finally:
-        conn.close()
-
-
-def _cli_api_key():
-    path = clockify_cli_config_path()
-    if not path.is_file():
+    if not ldb_dir.is_dir():
         return ""
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            m = re.match(r"^\s*token\s*:\s*['\"]?([^'\"\s#]+)['\"]?\s*$", line)
-            if m and m.group(1) not in ("null", "~"):
-                return m.group(1).strip()
-    except OSError:
-        pass
-    return ""
+
+    jwt_re = re.compile(rb"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+    for fn in sorted(glob.glob(str(ldb_dir / "*"))):
+        if not (fn.endswith(".ldb") or fn.endswith(".log")):
+            continue
+        try:
+            raw = Path(fn).read_bytes()
+        except OSError:
+            continue
+        blobs = [raw]
+        if fn.endswith(".ldb"):
+            blobs.append(_read_ldb_blocks(raw))
+        for blob in blobs:
+            for m in jwt_re.finditer(blob):
+                tok = m.group(0).decode("ascii", "ignore")
+                claims = _decode_jwt_claims(tok)
+                if not claims or str(claims.get("type") or "") != "access":
+                    continue
+                iat = int(claims.get("iat") or 0)
+                exp = int(claims.get("exp") or 0)
+                if exp > now_ts + 30:
+                    access_candidates.append((iat, exp, tok))
+
+    if not access_candidates:
+        return ""
+    access_candidates.sort(key=lambda item: item[0])
+    return access_candidates[-1][2]
 
 
-def resolve_auth(config, force_refresh_desktop=False):
+def resolve_auth(config):
     """Return (credential, header_name, auth_source) or ('', '', '')."""
     key = str(config.get("apiKey") or os.environ.get("CLOCKIFY_API_KEY") or "").strip()
     if key:
         return key, "X-Api-Key", "api-key"
-    cli_key = _cli_api_key()
-    if cli_key:
-        return cli_key, "X-Api-Key", "clockify-cli"
 
-    now_ts = time.time()
-    best_access, best_refresh = _discover_desktop_tokens(config)
-    if not force_refresh_desktop and best_access and best_access[1] > now_ts + 60:
-        return best_access[2], "X-Auth-Token", "desktop-app"
-
-    if best_refresh and best_refresh[1] > now_ts + 60:
-        new_tok, new_rtok = _refresh_desktop_token(best_refresh[2])
-        config["desktopAccessToken"] = new_tok
-        config["desktopRefreshToken"] = new_rtok
-        save_config(config)
-        return new_tok, "X-Auth-Token", "desktop-app"
+    if config.get("useDesktopSession") is True:
+        tok = _discover_desktop_access_token()
+        if tok:
+            return tok, "X-Auth-Token", "desktop-app"
 
     return "", "", ""
 
@@ -362,7 +299,7 @@ class Api:
                 pass
         self.connection = None
 
-    def call(self, method, path, body=None, params=None, _retried_auth=False):
+    def call(self, method, path, body=None, params=None):
         target = API_PATH + path
         if params:
             target += "?" + urllib.parse.urlencode(params)
@@ -392,7 +329,11 @@ class Api:
                     self.address = candidate
                 self.connection.request(method, target, payload, headers)
                 response = self.connection.getresponse()
-                raw = response.read().decode("utf-8", "replace")
+                raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw_bytes) > MAX_RESPONSE_BYTES:
+                    self._close()
+                    raise ApiError("Clockify response exceeded size limit")
+                raw = raw_bytes.decode("utf-8", "replace")
             except (OSError, http.client.HTTPException) as error:
                 self._close()
                 failure = error
@@ -400,15 +341,7 @@ class Api:
                     candidates.insert(0, candidate)
                 continue
             self.good_host = candidate[1][0]
-            try:
-                return self._decode(response.status, raw)
-            except ApiError as err:
-                if err.code == 401 and self.auth_source == "desktop-app" and not _retried_auth:
-                    new_cred, _, _ = resolve_auth(self.config, force_refresh_desktop=True)
-                    if new_cred:
-                        self.credential = new_cred
-                        return self.call(method, path, body=body, params=params, _retried_auth=True)
-                raise
+            return self._decode(response.status, raw)
 
         raise ApiError("Clockify did not answer (%s)" % (describe(failure),))
 
@@ -981,6 +914,13 @@ def cmd_status(args):
     return payload
 
 
+def _csv_safe(value):
+    text = str(value if value is not None else "")
+    if text and text[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + text
+    return text
+
+
 def cmd_export_csv(args):
     config = load_config()
     api, ident, source = open_client(config)
@@ -1023,8 +963,8 @@ def cmd_export_csv(args):
                 continue
         filtered.append(e)
 
-    s_lbl = start_date or snap.get("loadedStartDate") or "start"
-    e_lbl = end_date or snap.get("loadedEndDate") or "today"
+    s_lbl = re.sub(r"[^A-Za-z0-9._-]", "_", str(start_date or snap.get("loadedStartDate") or "start"))
+    e_lbl = re.sub(r"[^A-Za-z0-9._-]", "_", str(end_date or snap.get("loadedEndDate") or "today"))
     out_raw = str(getattr(args, "output", "") or "").strip()
     if out_raw:
         out_path = Path(out_raw).expanduser()
@@ -1037,16 +977,16 @@ def cmd_export_csv(args):
         writer.writerow(["Date", "Start", "End", "Duration", "Seconds", "Description", "Project", "Client", "Task", "Tags", "Billable"])
         for e in filtered:
             writer.writerow([
-                e.get("dateIso", ""),
-                e.get("startLocal", ""),
-                e.get("endLocal", ""),
-                _format_hms(e.get("seconds", 0)),
+                _csv_safe(e.get("dateIso", "")),
+                _csv_safe(e.get("startLocal", "")),
+                _csv_safe(e.get("endLocal", "")),
+                _csv_safe(_format_hms(e.get("seconds", 0))),
                 int(e.get("seconds", 0)),
-                e.get("description", ""),
-                e.get("projectName", ""),
-                e.get("clientName", ""),
-                e.get("taskName", ""),
-                ", ".join(e.get("tagNames") or []),
+                _csv_safe(e.get("description", "")),
+                _csv_safe(e.get("projectName", "")),
+                _csv_safe(e.get("clientName", "")),
+                _csv_safe(e.get("taskName", "")),
+                _csv_safe(", ".join(e.get("tagNames") or [])),
                 "Yes" if e.get("billable") else "No",
             ])
 
@@ -1464,6 +1404,9 @@ def cmd_set_key(args):
     api = Api(key, "X-Api-Key", str(config.get("apiHost") or ""), auth_source="api-key", config=config)
     ident = identity({}, api)
     config["apiKey"] = key
+    config.pop("useDesktopSession", None)
+    config.pop("desktopAccessToken", None)
+    config.pop("desktopRefreshToken", None)
     config["workspaceId"] = ident.workspace_id
     save_config(config)
 
@@ -1473,16 +1416,35 @@ def cmd_set_key(args):
     return payload
 
 
+def cmd_connect_desktop(args):
+    tok = _discover_desktop_access_token()
+    if not tok:
+        raise ApiError("No active Clockify Desktop session found. Sign in to Clockify Desktop first or paste an API key.")
+
+    config = load_config()
+    api = Api(tok, "X-Auth-Token", str(config.get("apiHost") or ""), auth_source="desktop-app", config=config)
+    ident = identity({}, api)
+    config["useDesktopSession"] = True
+    config.pop("apiKey", None)
+    config.pop("desktopAccessToken", None)
+    config.pop("desktopRefreshToken", None)
+    config["workspaceId"] = ident.workspace_id
+    save_config(config)
+
+    payload = snapshot(config, api, ident, full=True, auth_source="desktop-app")
+    payload["note"] = "Connected to Clockify Desktop session"
+    remember_host(config, api)
+    return payload
+
+
 def cmd_clear_key(args):
     config = load_config()
     config.pop("apiKey", None)
+    config.pop("useDesktopSession", None)
+    config.pop("desktopAccessToken", None)
+    config.pop("desktopRefreshToken", None)
     save_config(config)
-    api, ident, source = open_client(config)
-    if api:
-        payload = snapshot(config, api, ident, full=True, auth_source=source)
-        payload["note"] = "API key removed (using %s)" % source
-        return payload
-    return unconfigured(config, note="API key removed")
+    return unconfigured(config, note="Disconnected")
 
 
 def _parse_bool_arg(val):
@@ -1653,7 +1615,10 @@ def build_parser():
     set_key = commands.add_parser("set-key", help="read an API key from stdin and store it")
     set_key.set_defaults(handler=cmd_set_key)
 
-    clear_key = commands.add_parser("clear-key", help="remove stored API key")
+    conn_desk = commands.add_parser("connect-desktop", help="explicitly opt in to read-only Clockify Desktop session")
+    conn_desk.set_defaults(handler=cmd_connect_desktop)
+
+    clear_key = commands.add_parser("clear-key", help="disconnect Clockify credentials")
     clear_key.set_defaults(handler=cmd_clear_key)
 
     set_cfg = commands.add_parser("set-config", help="update local preferences")

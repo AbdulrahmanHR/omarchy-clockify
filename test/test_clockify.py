@@ -217,6 +217,111 @@ class ClockifyHelperTests(unittest.TestCase):
         proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
 
+    def test_csv_safe_escapes_formula_prefixes(self):
+        self.assertEqual(clockify._csv_safe("=CMD()"), "'=CMD()")
+        self.assertEqual(clockify._csv_safe("+1+1"), "'+1+1")
+        self.assertEqual(clockify._csv_safe("-2+3"), "'-2+3")
+        self.assertEqual(clockify._csv_safe("@SUM"), "'@SUM")
+        self.assertEqual(clockify._csv_safe("Normal task"), "Normal task")
+
+
+class AuthIsolationTests(unittest.TestCase):
+    @staticmethod
+    def _make_jwt(typ, exp_offset=3600):
+        import time as _time
+
+        header = base64.urlsafe_b64encode(b'{"alg":"HS256"}').rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(
+            json.dumps({
+                "type": typ,
+                "iat": int(_time.time()),
+                "exp": int(_time.time()) + exp_offset,
+            }).encode()
+        ).rstrip(b"=").decode()
+        return f"{header}.{payload}.sig"
+
+    def test_status_does_not_read_desktop_leveldb_without_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            ldb_dir = xdg / "Clockify" / "Local Storage" / "leveldb"
+            ldb_dir.mkdir(parents=True)
+            access_jwt = self._make_jwt("access")
+            (ldb_dir / "000001.log").write_text(f'_file://\x00\x01token"{access_jwt}"', encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                self.assertEqual(clockify.resolve_auth({}), ("", "", ""))
+                res = clockify.cmd_status(clockify.build_parser().parse_args(["status"]))
+                self.assertTrue(res["ok"])
+                self.assertFalse(res["configured"])
+                self.assertEqual(res["authSource"], "")
+                # Once explicitly opted in, the active Desktop access token is read in memory.
+                cred, hdr, src = clockify.resolve_auth({"useDesktopSession": True})
+                self.assertEqual(cred, access_jwt)
+                self.assertEqual(hdr, "X-Auth-Token")
+                self.assertEqual(src, "desktop-app")
+
+    def test_connect_desktop_opts_in_without_storing_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            ldb_dir = xdg / "Clockify" / "Local Storage" / "leveldb"
+            ldb_dir.mkdir(parents=True)
+            access_jwt = self._make_jwt("access")
+            refresh_jwt = self._make_jwt("refresh", exp_offset=86400)
+            (ldb_dir / "000001.log").write_text(
+                f'token="{access_jwt}" refreshToken="{refresh_jwt}"',
+                encoding="utf-8",
+            )
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text(
+                json.dumps({"desktopAccessToken": "legacy", "desktopRefreshToken": "legacy"}),
+                encoding="utf-8",
+            )
+
+            ident = clockify.Identity("u1", "w1", "Tester")
+            fake_snap = {"ok": True, "configured": True, "authSource": "desktop-app"}
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False), \
+                 mock.patch.object(clockify, "Api") as mock_api, \
+                 mock.patch.object(clockify, "identity", return_value=ident), \
+                 mock.patch.object(clockify, "snapshot", return_value=fake_snap):
+                mock_api.return_value.good_host = "1.2.3.4"
+                res = clockify.cmd_connect_desktop(clockify.build_parser().parse_args(["connect-desktop"]))
+
+            self.assertTrue(res["configured"])
+            saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+            self.assertTrue(saved.get("useDesktopSession"))
+            self.assertNotIn("desktopAccessToken", saved)
+            self.assertNotIn("desktopRefreshToken", saved)
+            self.assertNotIn("token", saved)
+            self.assertNotIn("apiKey", saved)
+
+    def test_clear_key_disconnects_both_api_key_and_desktop_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text(
+                json.dumps({
+                    "apiKey": "secret",
+                    "useDesktopSession": True,
+                    "desktopAccessToken": "legacy",
+                    "desktopRefreshToken": "legacy",
+                    "weekStart": "monday",
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                res = clockify.cmd_clear_key(clockify.build_parser().parse_args(["clear-key"]))
+
+            self.assertTrue(res["ok"])
+            self.assertFalse(res["configured"])
+            saved = json.loads(cfg_file.read_text(encoding="utf-8"))
+            self.assertNotIn("apiKey", saved)
+            self.assertNotIn("useDesktopSession", saved)
+            self.assertNotIn("desktopAccessToken", saved)
+            self.assertNotIn("desktopRefreshToken", saved)
+            self.assertEqual(saved.get("weekStart"), "monday")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -275,6 +275,10 @@ Item {
     keyProcess.running = true
   }
 
+  function connectDesktop() {
+    runAction([helperPath, "connect-desktop"], true)
+  }
+
   function clearKey() {
     runAction([helperPath, "clear-key"], true)
   }

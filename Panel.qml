@@ -749,7 +749,7 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Sign in to the Clockify Desktop app (auto-detected) or paste a personal API key from Clockify Preferences → Advanced → API."
+              text: "Paste a personal API key (Clockify → Preferences → Advanced → API), or explicitly opt in to use your active Clockify Desktop session in read-only mode (tokens are never refreshed or copied to disk)."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -788,21 +788,22 @@ Panel {
               spacing: Style.space(8)
 
               Button {
+                text: "Use Clockify Desktop Session"
+                iconText: "󰌆"
+                bordered: true
+                enabled: !clockify.actionBusy
+                foreground: root.accent
+                fontFamily: root.fontFamily
+                onClicked: clockify.connectDesktop()
+              }
+
+              Button {
                 text: "Open Clockify App"
                 iconText: "󰀻"
                 bordered: true
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 onClicked: clockify.launchDesktopApp()
-              }
-
-              Button {
-                text: "Re-scan Desktop Session"
-                iconText: "󰑐"
-                bordered: true
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                onClicked: clockify.refresh(true)
               }
             }
           }
@@ -2508,7 +2509,7 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Auth source: " + (clockify.authSource === "desktop-app" ? "Clockify Desktop App session (auto)" : clockify.authSource)
+              text: "Auth source: " + (clockify.authSource === "desktop-app" ? "Clockify Desktop session (read-only)" : clockify.authSource)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -2537,8 +2538,8 @@ Panel {
               }
 
               Button {
-                visible: clockify.authSource === "api-key"
-                text: "Forget API Key"
+                visible: clockify.configured
+                text: clockify.authSource === "desktop-app" ? "Disconnect Desktop Session" : "Forget API Key"
                 iconText: "󰌆"
                 bordered: true
                 foreground: root.urgent

@@ -285,7 +285,7 @@ function recentQuickPresets(entries, limit) {
 function statusLine(error, note, configured) {
   if (String(error || "") !== "") return String(error)
   if (String(note || "") !== "") return String(note)
-  if (!configured) return "Log into Clockify Desktop or paste an API key."
+  if (!configured) return "Paste an API key or opt in to Clockify Desktop."
   return ""
 }
 

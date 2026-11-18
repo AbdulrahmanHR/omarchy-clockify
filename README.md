@@ -7,7 +7,7 @@ A full-featured [Clockify](https://clockify.me) time tracker, analytics dashboar
 ## What it does
 
 - **Live bar pill.** Shows the Clockify icon dimmed when idle, or live `H:MM:SS` elapsed time (and optional active task label) while a timer runs. Hover for task, project, elapsed time, today's total, and this week's total. Left-click opens the panel, right-click toggles start/stop, middle-click refreshes.
-- **Zero-config Desktop Session Auto-Sync + API Key fallback.** Automatically reads and refreshes your logged-in Clockify Desktop session (`~/.config/Clockify/Local Storage/leveldb/`), or accepts a personal API key stored with `0600` permissions in `~/.config/omarchy/clockify.json`, `$CLOCKIFY_API_KEY`, or `~/.config/clockify-cli/config.yaml`.
+- **Personal API Key or Explicit Clockify Desktop Opt-In.** Store a personal API key (`0600` in `~/.config/omarchy/clockify.json` or `$CLOCKIFY_API_KEY`), or explicitly click **Use Clockify Desktop Session** to read your active Clockify Desktop access token in memory without refreshing or copying tokens to disk.
 - **Full Timer & Running Entry Control.** Start, switch, stop, or discard timers. Live-edit the currently running entry's description, project, task, tags, billability, start `HH:MM`, or `-5m` / `+5m` offsets without stopping it.
 - **Manual Time Entry & Quick Resume.** Switch between live Timer mode and Manual Entry mode (`today`, `yesterday`, or `YYYY-MM-DD` with start/end `HH:MM`), or click recent entry chips to prefill your next entry.
 - **Interactive Analytics Dashboard.** Browse `Day`, `Week`, `Month`, `Year`, `All`, or `Custom` date ranges with `‹` / `›` period stepping, 4 KPI cards (Total, Billable %, Daily Average, Top Project), an interactive hourly/daily/monthly activity bar chart (click any day bar to drill into that day), a stacked distribution bar and clickable breakdown (`By Project`, `By Task`, `By Tag`, `By Day`), multi-filter controls (Project, Task, Tag, Billable status, Search text), date-grouped entry rows (`Continue`, `Edit`, `Duplicate`, `Delete`), and one-click CSV export to `~/Downloads/`.
@@ -37,8 +37,10 @@ omarchy restart shell
 
 ## Authentication
 
-1. **Clockify Desktop app (automatic):** If you are signed into Clockify Desktop, the plugin discovers and refreshes your token automatically on first refresh.
-2. **Personal API Key:** Open the panel and paste your API key from Clockify → **Preferences → Advanced → API** (stored in `~/.config/omarchy/clockify.json` with `0600` permissions), or set `$CLOCKIFY_API_KEY`.
+Clockify credentials are never read automatically from Clockify Desktop without your consent:
+
+1. **Personal API Key (recommended):** Open the panel and paste your API key from Clockify → **Preferences → Advanced → API** (stored in `~/.config/omarchy/clockify.json` with `0600` permissions), or set `$CLOCKIFY_API_KEY`.
+2. **Clockify Desktop session (explicit opt-in):** Click **Use Clockify Desktop Session** (or run `./clockify.py connect-desktop`) to explicitly opt in (`"useDesktopSession": true`). When opted in, the helper reads the active access JWT from `~/.config/Clockify/Local Storage/leveldb/` strictly in memory and never refreshes or stores Desktop tokens in `clockify.json`. Click **Disconnect Desktop Session** (or run `./clockify.py clear-key`) at any time to opt back out.
 
 ## Widget Settings
 
