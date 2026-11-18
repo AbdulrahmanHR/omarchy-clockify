@@ -571,6 +571,118 @@ class AuthIsolationTests(unittest.TestCase):
                 api_ro.call(method, "/workspaces/w1/time-entries", body={"start": "2026-11-17T08:00:00Z"})
             self.assertIn("read-only", str(ctx.exception).lower())
 
+    def test_service_qml_clears_prior_account_on_external_account_change(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        service_path = PLUGIN_DIR / "Service.qml"
+        model_path = PLUGIN_DIR / "Model.js"
+        script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const qml = fs.readFileSync({json.dumps(str(service_path))}, 'utf8');
+
+        function extractFn(name) {{
+          const start = qml.indexOf('function ' + name + '(');
+          if (start === -1) throw new Error('Missing function ' + name);
+          let depth = 0;
+          let inBody = false;
+          for (let i = start; i < qml.length; i++) {{
+            const ch = qml[i];
+            if (ch === '{{') {{ depth++; inBody = true; }}
+            else if (ch === '}}') {{
+              depth--;
+              if (inBody && depth === 0) return qml.slice(start, i + 1);
+            }}
+          }}
+          throw new Error('Unclosed function ' + name);
+        }}
+
+        const Model = {{}};
+        vm.createContext(Model);
+        vm.runInContext(fs.readFileSync({json.dumps(str(model_path))}, 'utf8'), Model);
+
+        const refreshCalls = [];
+        const ctx = {{
+          Model,
+          noteTimer: {{ restart() {{}} }},
+          Qt: {{ callLater(fn) {{ fn(); }} }},
+          configured: false, authSource: '', userId: '', userName: '', userEmail: '',
+          workspaceId: '', workspaceName: '', workspaces: [], projects: [], tags: [], clients: [],
+          running: null, recentEntries: [], todaySeconds: 0, weekSeconds: 0, monthSeconds: 0,
+          todayBillableSeconds: 0, weekBillableSeconds: 0, monthBillableSeconds: 0,
+          loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
+          fullLoaded: false, lastFullRefreshMs: 0, _nextIsCacheOnly: false,
+          lastError: '', note: '', lastAutoStoppedId: '',
+          defaultProjectId: '', defaultTaskId: '', defaultTagIds: [], defaultBillable: false,
+          weekStart: 'monday', panelWidth: 560, panelHeight: 740, wrapText: true,
+          timeStepMinutes: 5, quickStepMinutes: 1, durationFormat: 'compact',
+          groupSimilarEntries: true, pomodoroEnabled: false, pomodoroAutoTimer: true,
+          pomodoroWorkMin: 25, pomodoroBreakMin: 5, dailyTargetHours: 8, weeklyTargetHours: 40,
+          stopOnIdle: false, idleStopMin: 240, remindWhenIdle: false, idleRemindMin: 30,
+          refresh(full) {{ refreshCalls.push(Boolean(full)); }},
+        }};
+        ctx.root = ctx;
+        vm.createContext(ctx);
+        vm.runInContext(
+          [
+            extractFn('applyConfigPayload'),
+            extractFn('clearAccountData'),
+            extractFn('_identityChanged'),
+            extractFn('applyPayload'),
+          ].join('\\n'),
+          ctx
+        );
+
+        const accountA = {{
+          ok: true, configured: true, authSource: 'desktop-app',
+          userId: 'user-a', userName: 'Alice', userEmail: 'a@example.com',
+          workspaceId: 'ws-a', workspaceName: 'Alice WS',
+          workspaces: [{{ id: 'ws-a', name: 'Alice WS' }}],
+          projects: [{{ id: 'p-a', name: 'Secret A' }}],
+          tags: [{{ id: 't-a', name: 'Tag A' }}],
+          clients: [{{ id: 'c-a', name: 'Client A' }}],
+          recentEntries: [{{ id: 'e-a1', description: 'Alice work', start: '2026-11-18T09:00:00Z' }}],
+          fullLoaded: true,
+        }};
+
+        // 1. Account A -> external switch to Account B via rangeOnly payload
+        ctx.applyPayload(JSON.stringify(accountA));
+        ctx.applyPayload(JSON.stringify({{
+          ok: true, configured: true, authSource: 'desktop-app',
+          userId: 'user-b', userName: 'Bob', userEmail: 'b@example.com',
+          workspaceId: 'ws-b', rangeOnly: true, fullLoaded: false,
+          recentEntries: [{{ id: 'e-b1', description: 'Bob work', start: '2026-11-18T10:00:00Z' }}],
+          loadedStartDate: '2026-11-01', loadedEndDate: '2026-11-18',
+        }}));
+        if (ctx.recentEntries.length !== 1 || ctx.recentEntries[0].id !== 'e-b1') {{
+          throw new Error('rangeOnly leaked prior entries: ' + JSON.stringify(ctx.recentEntries));
+        }}
+        if (ctx.projects.length || ctx.tags.length || ctx.clients.length || ctx.workspaces.length) {{
+          throw new Error('rangeOnly leaked prior metadata');
+        }}
+        if (ctx.fullLoaded !== false || refreshCalls.pop() !== true) {{
+          throw new Error('rangeOnly did not trigger full refresh after account change');
+        }}
+
+        // 2. Account A -> external switch to Account B via non-full status refresh
+        ctx.applyPayload(JSON.stringify(accountA));
+        ctx.applyPayload(JSON.stringify({{
+          ok: true, configured: true, authSource: 'desktop-app',
+          userId: 'user-b', userName: 'Bob', userEmail: 'b@example.com',
+          workspaceId: 'ws-b', rangeOnly: false, fullLoaded: false,
+          recentEntries: [{{ id: 'e-b2', description: 'Bob status', start: '2026-11-18T11:00:00Z' }}],
+        }}));
+        if (ctx.projects.length || ctx.tags.length || ctx.clients.length || ctx.workspaces.length || ctx.workspaceName !== '') {{
+          throw new Error('non-full status kept prior metadata');
+        }}
+        if (ctx.fullLoaded !== false || refreshCalls.pop() !== true) {{
+          throw new Error('non-full status did not trigger full refresh after account change');
+        }}
+        """
+        proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -565,6 +565,41 @@ Item {
     }
   }
 
+  function clearAccountData() {
+    workspaces = []
+    projects = []
+    tags = []
+    clients = []
+    recentEntries = []
+    running = null
+    todaySeconds = 0
+    weekSeconds = 0
+    monthSeconds = 0
+    todayBillableSeconds = 0
+    weekBillableSeconds = 0
+    monthBillableSeconds = 0
+    loadedStartDate = ""
+    loadedEndDate = ""
+    fetchedAt = ""
+    fullLoaded = false
+    lastFullRefreshMs = 0
+    workspaceName = ""
+    workspaceId = ""
+    userName = ""
+    userEmail = ""
+    userId = ""
+    lastAutoStoppedId = ""
+  }
+
+  function _identityChanged(prevConfigured, prevAuthSource, prevUserId, prevWorkspaceId,
+                            nextConfigured, nextAuthSource, nextUserId, nextWorkspaceId) {
+    if (!prevConfigured || !nextConfigured) return false
+    if (prevUserId !== "" && nextUserId !== "" && prevUserId !== nextUserId) return true
+    if (prevWorkspaceId !== "" && nextWorkspaceId !== "" && prevWorkspaceId !== nextWorkspaceId) return true
+    if (prevAuthSource !== "" && nextAuthSource !== "" && prevAuthSource !== nextAuthSource) return true
+    return false
+  }
+
   function applyPayload(raw) {
     var payload = Model.parsePayload(raw)
 
@@ -573,18 +608,54 @@ Item {
       note = ""
       if (payload.configured !== undefined) configured = payload.configured === true
       if (payload.authSource !== undefined) authSource = String(payload.authSource || "")
+      if (!configured) clearAccountData()
       return payload
     }
 
+    var prevConfigured = configured
+    var prevAuthSource = authSource
+    var prevUserId = userId
+    var prevWorkspaceId = workspaceId
+
+    var nextConfigured = payload.configured === true
+    var nextAuthSource = String(payload.authSource || "")
+    var nextUserId = String(payload.userId || "")
+    var nextWorkspaceId = String(payload.workspaceId || "")
+    var accountChanged = _identityChanged(
+      prevConfigured, prevAuthSource, prevUserId, prevWorkspaceId,
+      nextConfigured, nextAuthSource, nextUserId, nextWorkspaceId
+    )
+
     lastError = String(payload.error || "")
     note = String(payload.note || "")
-    configured = payload.configured === true
-    authSource = String(payload.authSource || "")
-    userId = String(payload.userId || "")
+    configured = nextConfigured
+    authSource = nextAuthSource
+    userId = nextUserId
     userName = String(payload.userName || "")
 
+    if (!configured) {
+      clearAccountData()
+      applyConfigPayload(payload)
+      if (note !== "") noteTimer.restart()
+      return payload
+    }
+
+    if (accountChanged) {
+      clearAccountData()
+      userId = nextUserId
+      userName = String(payload.userName || "")
+    }
+
     if (payload.rangeOnly === true) {
+      if (payload.userEmail !== undefined) userEmail = String(payload.userEmail || "")
+      if (nextWorkspaceId !== "") workspaceId = nextWorkspaceId
+      applyConfigPayload(payload)
       if (payload.exportPath && String(payload.exportPath) !== "") {
+        if (accountChanged) {
+          Qt.callLater(function() {
+            if (root.configured && !root.fullLoaded) root.refresh(true)
+          })
+        }
         if (note !== "") noteTimer.restart()
         return payload
       }
@@ -612,12 +683,17 @@ Item {
       recentEntries = merged
       loadedStartDate = String(payload.loadedStartDate || loadedStartDate)
       loadedEndDate = String(payload.loadedEndDate || loadedEndDate)
+      if (accountChanged) {
+        Qt.callLater(function() {
+          if (root.configured && !root.fullLoaded) root.refresh(true)
+        })
+      }
       if (note !== "") noteTimer.restart()
       return payload
     }
 
     userEmail = String(payload.userEmail || "")
-    workspaceId = String(payload.workspaceId || "")
+    workspaceId = nextWorkspaceId
     running = payload.running || null
     recentEntries = Array.isArray(payload.recentEntries) ? payload.recentEntries : []
     todaySeconds = Number(payload.todaySeconds || 0)
@@ -640,20 +716,12 @@ Item {
       workspaceName = String(payload.workspaceName || "")
       fullLoaded = true
       if (!root._nextIsCacheOnly) root.lastFullRefreshMs = Date.now()
+    } else if (accountChanged) {
+      Qt.callLater(function() {
+        if (root.configured && !root.fullLoaded) root.refresh(true)
+      })
     }
 
-    if (!configured) {
-      workspaces = []
-      projects = []
-      tags = []
-      clients = []
-      recentEntries = []
-      fullLoaded = false
-      workspaceName = ""
-      userName = ""
-      userEmail = ""
-      userId = ""
-    }
     if (note !== "") noteTimer.restart()
     return payload
   }
