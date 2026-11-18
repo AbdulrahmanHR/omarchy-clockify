@@ -121,6 +121,10 @@ Panel {
   property bool runEditBillable: false
   property string runEditStart: ""
   property int runEditAdjustMin: 0
+  property bool runEditStartManual: false
+  property bool _updatingRunEditStartFromAdjust: false
+  readonly property int livePrimaryStepMin: Math.min(Math.max(1, clockify.timeStepMinutes), Math.max(1, clockify.quickStepMinutes))
+  readonly property int liveSecondaryStepMin: Math.max(Math.max(1, clockify.timeStepMinutes), Math.max(1, clockify.quickStepMinutes))
   property bool confirmDiscard: false
 
   // History filter & inline entry editor state
@@ -250,8 +254,11 @@ Panel {
     if (draftTaskId === "" && clockify.defaultTaskId !== "") {
       draftTaskId = clockify.defaultTaskId
     }
-    if ((!draftTagIds || draftTagIds.length === 0) && clockify.defaultTagIds && clockify.defaultTagIds.length > 0) {
-      draftTagIds = clockify.defaultTagIds.slice()
+    var currentDraftTags = Model.toArray(draftTagIds)
+    var defTags = Model.toArray(clockify.defaultTagIds)
+    if (currentDraftTags.length === 0 && defTags.length > 0) {
+      draftTagIds = defTags
+      if (tagsMulti) tagsMulti.values = defTags.slice()
     }
     draftBillable = clockify.defaultBillable
     if (newTaskProjectId === "" && clockify.projects.length > 0) {
@@ -281,15 +288,35 @@ Panel {
     runEditDescField.text = runEditDesc
     runEditProjectId = String(r.projectId || "")
     runEditTaskId = String(r.taskId || "")
-    runEditTagIds = Array.isArray(r.tagIds) ? r.tagIds.slice() : []
+    runEditTagIds = Model.toArray(r.tagIds)
+    if (runEditTagsMulti) runEditTagsMulti.values = runEditTagIds.slice()
     runEditBillable = r.billable === true
     runEditStart = String(r.startLocal || "")
-    runEditStartField.text = runEditStart
+    runEditStartManual = false
     runEditAdjustMin = 0
+    _updatingRunEditStartFromAdjust = true
+    runEditStartField.text = runEditStart
+    _updatingRunEditStartFromAdjust = false
     editRunningOpen = true
   }
 
+  function adjustRunningMinutes(delta) {
+    runEditAdjustMin += delta
+    _updatingRunEditStartFromAdjust = true
+    runEditStartField.text = Model.stepTimeHhMm(runEditStart, -runEditAdjustMin, clock.date)
+    _updatingRunEditStartFromAdjust = false
+  }
+
+  function resetRunningAdjust() {
+    runEditAdjustMin = 0
+    _updatingRunEditStartFromAdjust = true
+    runEditStartField.text = runEditStart
+    _updatingRunEditStartFromAdjust = false
+  }
+
   function saveRunningEdits() {
+    var origStart = String((clockify.running && clockify.running.startLocal) || "")
+    var explicitStart = (runEditStartManual && runEditStart !== origStart) ? runEditStart : ""
     clockify.updateRunning(
       runEditDescField.text,
       runEditProjectId,
@@ -297,7 +324,7 @@ Panel {
       runEditTagIds,
       runEditBillable,
       runEditAdjustMin,
-      runEditStartField.text !== String((clockify.running && clockify.running.startLocal) || "") ? runEditStartField.text : ""
+      explicitStart
     )
     editRunningOpen = false
   }
@@ -308,7 +335,7 @@ Panel {
     entryEditDesc = String(entry.description || "")
     entryEditProjectId = String(entry.projectId || "")
     entryEditTaskId = String(entry.taskId || "")
-    entryEditTagIds = Array.isArray(entry.tagIds) ? entry.tagIds.slice() : []
+    entryEditTagIds = Model.toArray(entry.tagIds)
     entryEditBillable = entry.billable === true
     entryEditDate = String(entry.dateIso || "today")
     entryEditStart = String(entry.startLocal || "")
@@ -392,11 +419,20 @@ Panel {
   Connections {
     target: clockify
     function onDefaultProjectIdChanged() { root.syncDraftDefaults() }
+    function onDefaultTaskIdChanged() { root.syncDraftDefaults() }
+    function onDefaultTagIdsChanged() { root.syncDraftDefaults() }
+    function onDefaultBillableChanged() { root.syncDraftDefaults() }
     function onProjectsChanged() { root.syncDraftDefaults() }
     function onRunningChanged() {
       if (!clockify.timing) {
         root.editRunningOpen = false
         root.confirmDiscard = false
+      } else if (!root.editRunningOpen && clockify.running) {
+        var rTags = Model.toArray(clockify.running.tagIds)
+        if (rTags.length > 0 && Model.toArray(root.draftTagIds).length === 0) {
+          root.draftTagIds = rTags
+          if (tagsMulti) tagsMulti.values = rTags.slice()
+        }
       }
     }
   }
@@ -410,7 +446,7 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): string { clockify.refresh(true); return "ok" }
     function startTimer(description: string, projectId: string): string {
-      clockify.start(description, projectId, "", [], clockify.defaultBillable)
+      clockify.start(description, projectId, "", clockify.defaultTagIds, clockify.defaultBillable)
       return "ok"
     }
     function stopTimer(): string { clockify.stop(); return "ok" }
@@ -541,10 +577,10 @@ Panel {
             spacing: Style.space(6)
 
             Text {
-              visible: Model.tagsLabel(clockify.running) !== ""
+              visible: Model.tagsLabel(clockify.running, clockify.tags) !== ""
               width: parent.width
               textFormat: Text.PlainText
-              text: "Tags: " + Model.tagsLabel(clockify.running)
+              text: "Tags: " + Model.tagsLabel(clockify.running, clockify.tags)
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -691,7 +727,13 @@ Panel {
                   values: root.runEditTagIds
                   foreground: root.foreground
                   fontFamily: root.fontFamily
-                  onChanged: function(vals) { root.runEditTagIds = vals }
+                  onChanged: function(vals) {
+                    var clean = Model.toArray(vals)
+                    root.runEditTagIds = clean
+                    root.draftTagIds = clean
+                    if (tagsMulti) tagsMulti.values = clean.slice()
+                    clockify.saveConfig({ tags: clean })
+                  }
                 }
 
                 RowLayout {
@@ -714,51 +756,74 @@ Panel {
                     foreground: root.foreground
                     accent: root.accent
                     fontFamily: root.fontFamily
-                  }
-
-                  Button {
-                    text: "-" + clockify.timeStepMinutes + "m"
-                    bordered: true
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.runEditAdjustMin -= clockify.timeStepMinutes
-                  }
-
-                  Button {
-                    text: "+" + clockify.timeStepMinutes + "m"
-                    bordered: true
-                    foreground: root.foreground
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.runEditAdjustMin += clockify.timeStepMinutes
-                  }
-
-                  Button {
-                    text: "-1m"
-                    bordered: true
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.runEditAdjustMin -= 1
-                  }
-
-                  Button {
-                    text: "+1m"
-                    bordered: true
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: root.runEditAdjustMin += 1
+                    onTextChanged: {
+                      if (!root._updatingRunEditStartFromAdjust && root.editRunningOpen) {
+                        root.runEditStart = text
+                        root.runEditStartManual = true
+                        root.runEditAdjustMin = 0
+                      }
+                    }
                   }
 
                   Text {
-                    visible: root.runEditAdjustMin !== 0
                     textFormat: Text.PlainText
-                    text: (root.runEditAdjustMin > 0 ? "+" : "") + root.runEditAdjustMin + "m"
-                    color: root.accent
+                    text: "Elapsed:"
+                    color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
+                  }
+
+                  Button {
+                    visible: root.liveSecondaryStepMin !== root.livePrimaryStepMin
+                    text: "-" + root.liveSecondaryStepMin + "m"
+                    bordered: true
+                    tooltipText: "Subtract " + root.liveSecondaryStepMin + " min from elapsed session (shifts start later)"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.adjustRunningMinutes(-root.liveSecondaryStepMin)
+                  }
+
+                  Button {
+                    text: "-" + root.livePrimaryStepMin + "m"
+                    bordered: true
+                    tooltipText: "Subtract " + root.livePrimaryStepMin + " min from elapsed session (shifts start later)"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.adjustRunningMinutes(-root.livePrimaryStepMin)
+                  }
+
+                  Button {
+                    text: "+" + root.livePrimaryStepMin + "m"
+                    bordered: true
+                    tooltipText: "Add " + root.livePrimaryStepMin + " min to elapsed session (shifts start earlier)"
+                    foreground: root.foreground
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.adjustRunningMinutes(root.livePrimaryStepMin)
+                  }
+
+                  Button {
+                    visible: root.liveSecondaryStepMin !== root.livePrimaryStepMin
+                    text: "+" + root.liveSecondaryStepMin + "m"
+                    bordered: true
+                    tooltipText: "Add " + root.liveSecondaryStepMin + " min to elapsed session (shifts start earlier)"
+                    foreground: root.dim
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.adjustRunningMinutes(root.liveSecondaryStepMin)
+                  }
+
+                  Button {
+                    visible: root.runEditAdjustMin !== 0
+                    text: (root.runEditAdjustMin > 0 ? "+" : "") + root.runEditAdjustMin + "m ✕"
+                    bordered: true
+                    tooltipText: "Elapsed duration offset (click to reset to 0m)"
+                    foreground: root.accent
+                    fontFamily: root.fontFamily
+                    fontSize: Style.font.caption
+                    onClicked: root.resetRunningAdjust()
                   }
 
                   Item { Layout.fillWidth: true }
@@ -1033,8 +1098,29 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 onChanged: function(vals) {
-                  root.draftTagIds = vals
-                  clockify.saveConfig({ tags: vals })
+                  var clean = Model.toArray(vals)
+                  root.draftTagIds = clean
+                  clockify.saveConfig({ tags: clean })
+                  if (
+                    clockify.timing &&
+                    clockify.running &&
+                    root.trackerMode === "timer" &&
+                    root.draftDescription === "" &&
+                    String(clockify.running.projectId || "") === root.draftProjectId &&
+                    String(clockify.running.taskId || "") === root.draftTaskId
+                  ) {
+                    root.runEditTagIds = clean
+                    if (runEditTagsMulti) runEditTagsMulti.values = clean.slice()
+                    clockify.updateRunning(
+                      String(clockify.running.description || ""),
+                      String(clockify.running.projectId || ""),
+                      String(clockify.running.taskId || ""),
+                      clean,
+                      clockify.running.billable === true,
+                      0,
+                      ""
+                    )
+                  }
                 }
               }
 
@@ -2886,6 +2972,7 @@ Panel {
                   root.draftProjectId = ""
                   root.draftTaskId = ""
                   root.draftTagIds = []
+                  if (tagsMulti) tagsMulti.values = []
                   clockify.switchWorkspace(val)
                 }
               }
@@ -3033,10 +3120,64 @@ Panel {
               }
             }
 
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+
+              NumberField {
+                label: "Second adjust step (min)"
+                value: clockify.quickStepMinutes
+                from: 1
+                to: 60
+                stepSize: 1
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onModified: function(val) {
+                  clockify.quickStepMinutes = val
+                  clockify.saveConfig({ quickStepMinutes: val })
+                }
+              }
+
+              Column {
+                Layout.fillWidth: true
+                spacing: Style.spacing.md
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Second step presets"
+                  color: Qt.darker(root.foreground, 1.4)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                ButtonGroup {
+                  value: String(clockify.quickStepMinutes)
+                  foreground: root.foreground
+                  background: Color.popups.background
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  options: [
+                    { value: "1", label: "1m" },
+                    { value: "5", label: "5m" },
+                    { value: "10", label: "10m" },
+                    { value: "15", label: "15m" },
+                    { value: "30", label: "30m" }
+                  ]
+                  onChanged: function(val) {
+                    var parsed = parseInt(val, 10)
+                    clockify.quickStepMinutes = parsed
+                    clockify.saveConfig({ quickStepMinutes: parsed })
+                  }
+                }
+              }
+            }
+
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Up/Down arrows & wheel adjust start/end times by " + clockify.timeStepMinutes + "m (Shift ±1m, Ctrl ±1h)."
+              text: "Up/Down arrows & wheel step HH:MM fields by " + clockify.timeStepMinutes + "m (Shift ±1m, Ctrl ±1h). Edit Live buttons nudge elapsed duration by ±" + root.livePrimaryStepMin + "m" + (root.liveSecondaryStepMin !== root.livePrimaryStepMin ? " and ±" + root.liveSecondaryStepMin + "m." : ".")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -3431,7 +3572,7 @@ Panel {
         values: root.entryEditTagIds
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onChanged: function(vals) { root.entryEditTagIds = vals }
+        onChanged: function(vals) { root.entryEditTagIds = Model.toArray(vals) }
       }
 
       RowLayout {

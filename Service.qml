@@ -44,6 +44,7 @@ Item {
   property int panelHeight: 740
   property bool wrapText: true
   property int timeStepMinutes: 5
+  property int quickStepMinutes: 1
   property string durationFormat: "compact"
   property bool groupSimilarEntries: true
   property real dailyTargetHours: 8
@@ -68,6 +69,8 @@ Item {
   property double lastRefreshMs: 0
   property bool _bootCachePending: true
   property bool _nextIsCacheOnly: false
+  property int _mutationSeq: 0
+  property var _actionQueue: []
 
   // Idle reminder tracking
   property double lastIdleNoticeMs: 0
@@ -96,6 +99,10 @@ Item {
     return Math.max(min, Math.min(max, parsed))
   }
 
+  function tagCsv(tagIds) {
+    return Model.toArray(tagIds).join(",")
+  }
+
   function notify(title, body) {
     Quickshell.execDetached(["notify-send", "-a", "Clockify", String(title || "Clockify"), String(body || "")])
   }
@@ -103,18 +110,20 @@ Item {
   // ------------------------------------------------------------- commands
 
   function refresh(full) {
-    if (!ready || statusProcess.running) return
+    if (!ready || statusProcess.running || actionProcess.running) return
     _nextIsCacheOnly = false
     var command = [helperPath, "status"]
     if (full === true || (!fullLoaded && configured)) command.push("--full")
     lastRefreshMs = Date.now()
+    statusProcess.seqAtStart = root._mutationSeq
     statusProcess.command = pythonCommand(command)
     statusProcess.running = true
   }
 
   function refreshFromCache() {
-    if (!ready || statusProcess.running) return
+    if (!ready || statusProcess.running || actionProcess.running) return
     _nextIsCacheOnly = true
+    statusProcess.seqAtStart = root._mutationSeq
     statusProcess.command = pythonCommand([helperPath, "status", "--from-cache"])
     statusProcess.running = true
   }
@@ -165,7 +174,7 @@ Item {
       "--description", String(description || ""),
       "--project", String(projectId === undefined || projectId === null ? "" : projectId),
       "--task", String(taskId === undefined || taskId === null ? "" : taskId),
-      "--tags", Array.isArray(tagIds) ? tagIds.join(",") : "",
+      "--tags", tagCsv(tagIds),
       billable ? "--billable" : "--no-billable"
     ]
     runAction(cmd, true)
@@ -204,12 +213,31 @@ Item {
   }
 
   function updateRunning(description, projectId, taskId, tagIds, billable, adjustMinutes, startTime) {
+    var cleanTags = Model.toArray(tagIds)
+    if (running && typeof running === "object") {
+      var tagMap = {}
+      for (var ti = 0; ti < tags.length; ti++) {
+        if (tags[ti] && tags[ti].id) tagMap[String(tags[ti].id)] = String(tags[ti].name || "")
+      }
+      var nextNames = []
+      for (var tj = 0; tj < cleanTags.length; tj++) {
+        if (tagMap[cleanTags[tj]]) nextNames.push(tagMap[cleanTags[tj]])
+      }
+      running = Object.assign({}, running, {
+        description: String(description || ""),
+        projectId: String(projectId === undefined || projectId === null ? "" : projectId),
+        taskId: String(taskId === undefined || taskId === null ? "" : taskId),
+        tagIds: cleanTags,
+        tagNames: nextNames,
+        billable: billable === true
+      })
+    }
     var cmd = [
       helperPath, "update-running",
       "--description", String(description || ""),
       "--project", String(projectId === undefined || projectId === null ? "" : projectId),
       "--task", String(taskId === undefined || taskId === null ? "" : taskId),
-      "--tags", Array.isArray(tagIds) ? tagIds.join(",") : "",
+      "--tags", cleanTags.join(","),
       billable ? "--billable" : "--no-billable"
     ]
     if (adjustMinutes && adjustMinutes !== 0) {
@@ -227,7 +255,7 @@ Item {
       "--description", String(description || ""),
       "--project", String(projectId === undefined || projectId === null ? "" : projectId),
       "--task", String(taskId === undefined || taskId === null ? "" : taskId),
-      "--tags", Array.isArray(tagIds) ? tagIds.join(",") : "",
+      "--tags", tagCsv(tagIds),
       billable ? "--billable" : "--no-billable",
       "--date", String(dateStr || "today"),
       "--start", String(startTime || ""),
@@ -254,7 +282,7 @@ Item {
       "--description", String(description || ""),
       "--project", String(projectId === undefined || projectId === null ? "" : projectId),
       "--task", String(taskId === undefined || taskId === null ? "" : taskId),
-      "--tags", Array.isArray(tagIds) ? tagIds.join(",") : "",
+      "--tags", tagCsv(tagIds),
       billable ? "--billable" : "--no-billable"
     ]
     if (dateStr !== undefined && String(dateStr).trim() !== "") {
@@ -357,17 +385,18 @@ Item {
   }
 
   function saveConfig(opts) {
-    if (!ready || actionProcess.running) return
+    if (!ready) return
     var cmd = [helperPath, "set-config"]
     if (opts.project !== undefined) cmd.push("--project", String(opts.project))
     if (opts.task !== undefined) cmd.push("--task", String(opts.task))
-    if (opts.tags !== undefined) cmd.push("--tags", Array.isArray(opts.tags) ? opts.tags.join(",") : String(opts.tags))
+    if (opts.tags !== undefined) cmd.push("--tags", typeof opts.tags === "string" ? opts.tags : tagCsv(opts.tags))
     if (opts.billable !== undefined) cmd.push("--billable", opts.billable ? "true" : "false")
     if (opts.weekStart !== undefined) cmd.push("--week-start", String(opts.weekStart))
     if (opts.panelWidth !== undefined) cmd.push("--panel-width", String(opts.panelWidth))
     if (opts.panelHeight !== undefined) cmd.push("--panel-height", String(opts.panelHeight))
     if (opts.wrapText !== undefined) cmd.push("--wrap-text", opts.wrapText ? "true" : "false")
     if (opts.timeStepMinutes !== undefined) cmd.push("--time-step-min", String(opts.timeStepMinutes))
+    if (opts.quickStepMinutes !== undefined) cmd.push("--quick-step-min", String(opts.quickStepMinutes))
     if (opts.durationFormat !== undefined) cmd.push("--duration-format", String(opts.durationFormat))
     if (opts.groupSimilarEntries !== undefined) cmd.push("--group-similar", opts.groupSimilarEntries ? "true" : "false")
     if (opts.pomodoro !== undefined) cmd.push("--pomodoro", opts.pomodoro ? "true" : "false")
@@ -441,13 +470,44 @@ Item {
     }
   }
 
-  function runAction(command, expectsSnapshot, isConfigOnly, rollbackRunning) {
-    if (!ready || actionProcess.running) return
-    actionProcess.expectsSnapshot = expectsSnapshot !== false
-    actionProcess.isConfigOnly = isConfigOnly === true
-    actionProcess.preOptimisticRunning = (rollbackRunning && typeof rollbackRunning === "object") ? rollbackRunning : null
-    actionProcess.command = pythonCommand(command)
+  function _startActionItem(item) {
+    actionProcess.expectsSnapshot = item.expectsSnapshot
+    actionProcess.isConfigOnly = item.isConfigOnly
+    actionProcess.preOptimisticRunning = item.rollbackRunning
+    actionProcess.command = pythonCommand(item.command)
     actionProcess.running = true
+  }
+
+  function _startNextAction() {
+    if (actionProcess.running || _actionQueue.length === 0) return
+    var q = _actionQueue.slice()
+    var nextItem = q.shift()
+    _actionQueue = q
+    _startActionItem(nextItem)
+  }
+
+  function runAction(command, expectsSnapshot, isConfigOnly, rollbackRunning) {
+    if (!ready) return
+    _mutationSeq += 1
+    var expectSnap = expectsSnapshot !== false
+    var cfgOnly = isConfigOnly === true
+    var rollback = (rollbackRunning && typeof rollbackRunning === "object") ? rollbackRunning : null
+    if (statusProcess.running && !cfgOnly) {
+      statusProcess.running = false
+    }
+    var item = {
+      command: command,
+      expectsSnapshot: expectSnap,
+      isConfigOnly: cfgOnly,
+      rollbackRunning: rollback
+    }
+    if (actionProcess.running) {
+      var q = _actionQueue.slice()
+      q.push(item)
+      _actionQueue = q
+      return
+    }
+    _startActionItem(item)
   }
 
   function pythonCommand(parts) {
@@ -460,13 +520,15 @@ Item {
     if (!payload || payload.ok === false) return
     defaultProjectId = String(payload.defaultProjectId || "")
     defaultTaskId = String(payload.defaultTaskId || "")
-    defaultTagIds = Array.isArray(payload.defaultTagIds) ? payload.defaultTagIds : []
+    defaultTagIds = Model.toArray(payload.defaultTagIds)
     defaultBillable = payload.defaultBillable === true
     weekStart = String(payload.weekStart || "monday")
     panelWidth = Number(payload.panelWidth || 560)
     panelHeight = Number(payload.panelHeight || 740)
     wrapText = payload.wrapText !== false
     timeStepMinutes = Number(payload.timeStepMinutes || 5)
+    var fallbackQuick = (timeStepMinutes === 1) ? 5 : 1
+    quickStepMinutes = Number(payload.quickStepMinutes || fallbackQuick)
     durationFormat = String(payload.durationFormat || "compact")
     groupSimilarEntries = payload.groupSimilarEntries !== false
     pomodoroEnabled = payload.pomodoroEnabled === true
@@ -662,6 +724,7 @@ Item {
 
   Process {
     id: statusProcess
+    property int seqAtStart: 0
     running: false
     command: []
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
@@ -669,10 +732,13 @@ Item {
     onExited: function(exitCode) {
       var wasCacheBoot = root._bootCachePending
       root._bootCachePending = false
-      if (exitCode === 0) {
-        root.applyPayload(statusOut.text)
-      } else if (!wasCacheBoot) {
-        root.lastError = root.helperFailure(statusErr.text, exitCode)
+      var stale = (seqAtStart !== root._mutationSeq) || actionProcess.running
+      if (!stale) {
+        if (exitCode === 0) {
+          root.applyPayload(statusOut.text)
+        } else if (!wasCacheBoot) {
+          root.lastError = root.helperFailure(statusErr.text, exitCode)
+        }
       }
       root._nextIsCacheOnly = false
       if (wasCacheBoot) {
@@ -696,17 +762,23 @@ Item {
       if (exitCode !== 0) {
         if (rollback !== null && root.running === null) root.running = rollback
         root.lastError = root.helperFailure(actionErr.text, exitCode)
+        root._startNextAction()
         return
       }
       if (isConfigOnly) {
         root.applyConfigPayload(Model.parsePayload(actionOut.text))
+        root._startNextAction()
         return
       }
-      if (!expectsSnapshot) return
+      if (!expectsSnapshot) {
+        root._startNextAction()
+        return
+      }
       var parsed = root.applyPayload(actionOut.text)
       if (parsed && parsed.ok === false && rollback !== null && root.running === null) {
         root.running = rollback
       }
+      root._startNextAction()
     }
   }
 

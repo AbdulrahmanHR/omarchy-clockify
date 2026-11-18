@@ -8,7 +8,7 @@ A full-featured [Clockify](https://clockify.me) time tracker, analytics dashboar
 
 - **Live bar pill.** Shows the Clockify icon dimmed when idle, or live `H:MM:SS` elapsed time (and optional active task label) while a timer runs. Hover for task, project, elapsed time, today's total, and this week's total. Left-click opens the panel, right-click toggles start/stop, middle-click refreshes.
 - **Personal API Key or Explicit Clockify Desktop Opt-In.** Store a personal API key (`0600` in `~/.config/omarchy/clockify.json` or `$CLOCKIFY_API_KEY`), or explicitly click **Use Clockify Desktop Session** to read your active Clockify Desktop access token in memory without refreshing or copying tokens to disk.
-- **Full Timer & Running Entry Control.** Start, switch, stop, split (`Split`), or discard timers. Live-edit the currently running entry's description, project, task, tags, billability, start `HH:MM` (with `▲`/`▼` arrows, Up/Down keys, or wheel stepping), `±step` / `±1m` offsets, or **Stop -Xm** without stopping first.
+- **Full Timer & Running Entry Control.** Start, switch, stop, split (`Split`), or discard timers. Live-edit the currently running entry's description, project, task, tags, billability, start `HH:MM` (with `▲`/`▼` arrows, Up/Down keys, or wheel stepping), configurable dual `Elapsed:` nudge buttons (`±timeStepMinutes` / `±quickStepMinutes` with one-click reset), or **Stop -Xm** without stopping first.
 - **Manual Time Entry, Time Steppers & Weekly Timesheet.** Switch between **Timer**, **Manual Entry** (`DateSpinField` + `TimeSpinField` with configurable minute step and one-click rounding, plus `Shift` for `±1m` and `Ctrl` for `±1h`), and **Timesheet** (7-day project matrix with daily totals and click-to-log cells). Track daily and weekly hour targets directly on the Today / Week summary cards.
 - **Interactive Analytics Dashboard.** Browse `Day`, `Week`, `Month`, `Year`, `All`, or `Custom` date ranges with `‹` / `›` period stepping, configurable duration display (`Compact`, `Full`, `Decimal`), toggleable grouping of identical same-day entries (`N×` badge with expandable rows), 4 KPI cards, an interactive activity bar chart, a stacked distribution bar (`By Project`, `By Task`, `By Tag`, `By Day`), multi-filter controls, paginated date groups, and CSV export to `~/Downloads/`.
 - **Workspace & Resource Management.** Filter, create, start from, archive, mark tasks Done, or delete **Projects**, **Tasks**, **Tags**, and **Clients** from the Manage tab, and switch between Clockify **Workspaces**.
@@ -74,7 +74,7 @@ Direct CLI usage:
 ./clockify.py update-running --adjust-minutes 5
 ./clockify.py split-running --minutes-ago 5
 ./clockify.py add-manual --date today --start 09:00 --end 10:30 --description "Planning"
-./clockify.py set-config --time-step-min 10 --duration-format full --daily-target-hours 8 --weekly-target-hours 40
+./clockify.py set-config --time-step-min 1 --quick-step-min 5 --duration-format full --daily-target-hours 8 --weekly-target-hours 40
 ./clockify.py export-csv --start-date 2026-11-01 --end-date 2026-11-30
 ```
 

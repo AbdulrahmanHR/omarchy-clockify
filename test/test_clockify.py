@@ -240,6 +240,23 @@ class ClockifyHelperTests(unittest.TestCase):
         if (ts.days.length !== 7 || ts.grandTotalSeconds !== 5400 || ts.rows.length < 2) {{
           throw new Error('buildWeeklyTimesheet failed: ' + JSON.stringify(ts));
         }}
+
+        // QML sequence-like tag arrays (where Array.isArray() is false) & workspace tag fallback
+        const qmlSeq = {{ 0: 't1', 1: 't2', length: 2 }};
+        const arr = ctx.toArray(qmlSeq);
+        if (!Array.isArray(arr) || arr.length !== 2 || arr[0] !== 't1' || arr[1] !== 't2') {{
+          throw new Error('toArray failed on array-like sequence: ' + JSON.stringify(arr));
+        }}
+        if (ctx.toArray('abc').length !== 0 || ctx.toArray(null).length !== 0) {{
+          throw new Error('toArray should return [] for strings/null');
+        }}
+        const lbl = ctx.tagsLabel(
+          {{ tagIds: {{ 0: 'g1', length: 1 }}, tagNames: [] }},
+          [{{ id: 'g1', name: 'Translation' }}]
+        );
+        if (lbl !== 'Translation') {{
+          throw new Error('tagsLabel fallback failed: ' + lbl);
+        }}
         """
         proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
@@ -252,6 +269,16 @@ class ClockifyHelperTests(unittest.TestCase):
         self.assertEqual(clockify._csv_safe("Normal task"), "Normal task")
 
     def test_set_config_and_time_step_preferences(self):
+        fallback_one = clockify.base_payload()
+        clockify._apply_prefs_to_payload(fallback_one, {"timeStepMinutes": 1})
+        self.assertEqual(fallback_one["timeStepMinutes"], 1)
+        self.assertEqual(fallback_one["quickStepMinutes"], 5)
+
+        fallback_fifteen = clockify.base_payload()
+        clockify._apply_prefs_to_payload(fallback_fifteen, {"timeStepMinutes": 15})
+        self.assertEqual(fallback_fifteen["timeStepMinutes"], 15)
+        self.assertEqual(fallback_fifteen["quickStepMinutes"], 1)
+
         with tempfile.TemporaryDirectory() as tmp:
             xdg = Path(tmp)
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
@@ -261,6 +288,7 @@ class ClockifyHelperTests(unittest.TestCase):
                     "--panel-height", "820",
                     "--wrap-text", "false",
                     "--time-step-min", "15",
+                    "--quick-step-min", "5",
                     "--duration-format", "decimal",
                     "--group-similar", "false",
                     "--pomodoro-auto-timer", "true",
@@ -273,6 +301,7 @@ class ClockifyHelperTests(unittest.TestCase):
                 self.assertEqual(res["panelHeight"], 820)
                 self.assertFalse(res["wrapText"])
                 self.assertEqual(res["timeStepMinutes"], 15)
+                self.assertEqual(res["quickStepMinutes"], 5)
                 self.assertEqual(res["durationFormat"], "decimal")
                 self.assertFalse(res["groupSimilarEntries"])
                 self.assertTrue(res["pomodoroAutoTimer"])
@@ -284,6 +313,7 @@ class ClockifyHelperTests(unittest.TestCase):
                 self.assertEqual(saved["panelHeight"], 820)
                 self.assertFalse(saved["wrapText"])
                 self.assertEqual(saved["timeStepMinutes"], 15)
+                self.assertEqual(saved["quickStepMinutes"], 5)
                 self.assertEqual(saved["durationFormat"], "decimal")
 
     def test_split_running_stops_and_starts_continuation(self):

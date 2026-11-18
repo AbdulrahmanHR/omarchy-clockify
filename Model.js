@@ -12,6 +12,17 @@ function neutralizeMarkup(value) {
     .replace(/>/g, "\u203a")
 }
 
+function toArray(v) {
+  if (!v || typeof v.length !== "number" || typeof v === "string") return []
+  var out = []
+  for (var i = 0; i < v.length; i++) {
+    if (v[i] !== undefined && v[i] !== null && String(v[i]) !== "") {
+      out.push(String(v[i]))
+    }
+  }
+  return out
+}
+
 function parsePayload(raw) {
   var text = String(raw || "").trim()
   if (text === "") return { ok: false, error: "The Clockify helper returned nothing" }
@@ -143,9 +154,23 @@ function taskLabel(entry) {
   return String(entry.taskName || "").trim()
 }
 
-function tagsLabel(entry) {
-  if (!entry || !Array.isArray(entry.tagNames) || entry.tagNames.length === 0) return ""
-  return entry.tagNames.join(", ")
+function tagsLabel(entry, workspaceTags) {
+  if (!entry) return ""
+  var names = toArray(entry.tagNames)
+  if (names.length > 0) return names.join(", ")
+  var ids = toArray(entry.tagIds)
+  if (ids.length === 0) return ""
+  var tagList = (workspaceTags && typeof workspaceTags.length === "number") ? workspaceTags : []
+  var byId = {}
+  for (var i = 0; i < tagList.length; i++) {
+    var t = tagList[i] || {}
+    if (t.id && t.name) byId[String(t.id)] = String(t.name)
+  }
+  var resolved = []
+  for (var j = 0; j < ids.length; j++) {
+    if (byId[ids[j]]) resolved.push(byId[ids[j]])
+  }
+  return resolved.join(", ")
 }
 
 function truncateText(text, maxLen) {

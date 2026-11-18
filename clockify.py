@@ -822,6 +822,7 @@ def base_payload():
         "panelHeight": 740,
         "wrapText": True,
         "timeStepMinutes": 5,
+        "quickStepMinutes": 1,
         "durationFormat": "compact",
         "groupSimilarEntries": True,
         "pomodoroEnabled": False,
@@ -855,6 +856,9 @@ def base_payload():
 
 
 def _apply_prefs_to_payload(payload, config):
+    time_step = _int_pref(config, "timeStepMinutes", 5, 1, 60)
+    default_quick_step = 5 if time_step == 1 else 1
+    quick_step = _int_pref(config, "quickStepMinutes", default_quick_step, 1, 60)
     payload.update({
         "defaultProjectId": str(config.get("defaultProjectId") or ""),
         "defaultTaskId": str(config.get("defaultTaskId") or ""),
@@ -864,7 +868,8 @@ def _apply_prefs_to_payload(payload, config):
         "panelWidth": _int_pref(config, "panelWidth", 560, 380, 1000),
         "panelHeight": _int_pref(config, "panelHeight", 740, 420, 1200),
         "wrapText": _bool_pref(config, "wrapText", True),
-        "timeStepMinutes": _int_pref(config, "timeStepMinutes", 5, 1, 60),
+        "timeStepMinutes": time_step,
+        "quickStepMinutes": quick_step,
         "durationFormat": _choice_pref(config, "durationFormat", ("compact", "full", "decimal"), "compact"),
         "groupSimilarEntries": _bool_pref(config, "groupSimilarEntries", True),
         "pomodoroEnabled": _bool_pref(config, "pomodoroEnabled", False),
@@ -2093,6 +2098,8 @@ def cmd_set_config(args):
         config["wrapText"] = _parse_bool_arg(args.wrap_text)
     if args.time_step_min is not None:
         config["timeStepMinutes"] = max(1, min(60, int(args.time_step_min)))
+    if args.quick_step_min is not None:
+        config["quickStepMinutes"] = max(1, min(60, int(args.quick_step_min)))
     if args.duration_format is not None:
         config["durationFormat"] = str(args.duration_format).strip().lower()
     if args.group_similar is not None:
@@ -2297,6 +2304,7 @@ def build_parser():
     set_cfg.add_argument("--panel-height", type=int, default=None)
     set_cfg.add_argument("--wrap-text", default=None)
     set_cfg.add_argument("--time-step-min", type=int, default=None)
+    set_cfg.add_argument("--quick-step-min", type=int, default=None)
     set_cfg.add_argument("--duration-format", default=None, choices=["compact", "full", "decimal"])
     set_cfg.add_argument("--group-similar", default=None)
     set_cfg.add_argument("--pomodoro", default=None)
