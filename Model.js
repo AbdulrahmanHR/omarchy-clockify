@@ -306,36 +306,6 @@ function filterEntries(entries, query) {
   return out
 }
 
-function recentQuickPresets(entries, limit) {
-  var list = Array.isArray(entries) ? entries : []
-  var maxItems = limit > 0 ? limit : 5
-  var seen = {}
-  var out = []
-  for (var i = 0; i < list.length && out.length < maxItems; i++) {
-    var e = list[i] || {}
-    var desc = String(e.description || "").trim()
-    var proj = String(e.projectId || "")
-    var task = String(e.taskId || "")
-    if (desc === "" && proj === "" && task === "") continue
-    var key = desc + "|" + proj + "|" + task
-    if (seen[key]) continue
-    seen[key] = true
-    var label = desc !== "" ? desc : (e.taskName || e.projectName || "Entry")
-    out.push({
-      label: truncateText(neutralizeMarkup(label), 22),
-      description: desc,
-      projectId: proj,
-      projectName: String(e.projectName || ""),
-      projectColor: String(e.projectColor || ""),
-      taskId: task,
-      taskName: String(e.taskName || ""),
-      tagIds: Array.isArray(e.tagIds) ? e.tagIds : [],
-      billable: e.billable === true
-    })
-  }
-  return out
-}
-
 function statusLine(error, note, configured) {
   if (String(error || "") !== "") return String(error)
   if (String(note || "") !== "") return String(note)

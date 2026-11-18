@@ -962,39 +962,6 @@ Panel {
               width: parent.width
               spacing: Style.space(8)
 
-              // Quick Resume recent presets
-              Flow {
-                visible: clockify.recentEntries.length > 0
-                width: parent.width
-                spacing: Style.space(6)
-
-                Repeater {
-                  model: Model.recentQuickPresets(clockify.recentEntries, 5)
-                  delegate: Button {
-                    required property var modelData
-                    text: modelData.label
-                    iconText: "󰐊"
-                    bordered: true
-                    tooltipText: Model.neutralizeMarkup(
-                      (modelData.description || "No description") +
-                      (modelData.projectName ? " · " + modelData.projectName : "") +
-                      (modelData.taskName ? " / " + modelData.taskName : "")
-                    )
-                    foreground: root.dim
-                    fontFamily: root.fontFamily
-                    fontSize: Style.font.caption
-                    onClicked: {
-                      root.draftDescription = modelData.description
-                      descriptionField.text = modelData.description
-                      root.draftProjectId = modelData.projectId
-                      root.draftTaskId = modelData.taskId
-                      root.draftTagIds = Array.isArray(modelData.tagIds) ? modelData.tagIds.slice() : []
-                      root.draftBillable = modelData.billable
-                    }
-                  }
-                }
-              }
-
               TextField {
                 id: descriptionField
                 width: parent.width
