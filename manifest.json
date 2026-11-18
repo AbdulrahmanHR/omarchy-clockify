@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "Abdulrahman Rahmouni",
   "license": "MIT",
-  "description": "Clockify time tracker, analytics dashboard, and workspace controller in the Omarchy bar: start, stop, edit, and discard timers, log manual hours, browse daily/weekly/monthly/yearly charts and project breakdowns, manage projects, tasks, tags, and clients, and run Pomodoro or idle reminders.",
+  "description": "Clockify time tracker, weekly timesheet, analytics dashboard, and workspace controller in the Omarchy bar: start, stop, split, edit, round, and step timer/manual hours with configurable arrow increments, browse daily/weekly/monthly/yearly charts and grouped history, manage/archive/delete projects, tasks, tags, and clients, track daily/weekly hour targets, and run synced Pomodoro or idle reminders.",
   "homepage": "https://github.com/AbdulrahmanHR/omarchy-clockify",
   "kinds": [
     "bar-widget"
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Clockify",
-    "description": "Track time, analyze Day/Week/Month/Year reports, edit entries live, manage projects/tasks/tags/clients, and run Pomodoro timers from the bar.",
+    "description": "Track time, edit with configurable minute steppers & rounding, view weekly timesheets and analytics reports, manage workspace entities, and run Pomodoro timers from the bar.",
     "category": "Time",
     "aliases": [
       "clockify",

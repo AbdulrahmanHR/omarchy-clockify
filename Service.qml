@@ -40,8 +40,14 @@ Item {
   property var defaultTagIds: []
   property bool defaultBillable: false
   property string weekStart: "monday"
+  property int timeStepMinutes: 5
+  property string durationFormat: "compact"
+  property bool groupSimilarEntries: true
+  property real dailyTargetHours: 8
+  property real weeklyTargetHours: 40
 
   property bool pomodoroEnabled: false
+  property bool pomodoroAutoTimer: true
   property int pomodoroWorkMin: 25
   property int pomodoroBreakMin: 5
   property bool stopOnIdle: false
@@ -53,6 +59,12 @@ Item {
   property bool pomodoroRunning: false
   property string pomodoroPhase: "work" // "work" | "break"
   property int pomodoroSecondsLeft: 0
+
+  // Refresh & cache tracking
+  property double lastFullRefreshMs: 0
+  property double lastRefreshMs: 0
+  property bool _bootCachePending: true
+  property bool _nextIsCacheOnly: false
 
   // Idle reminder tracking
   property double lastIdleNoticeMs: 0
@@ -89,10 +101,36 @@ Item {
 
   function refresh(full) {
     if (!ready || statusProcess.running) return
+    _nextIsCacheOnly = false
     var command = [helperPath, "status"]
     if (full === true || (!fullLoaded && configured)) command.push("--full")
+    lastRefreshMs = Date.now()
     statusProcess.command = pythonCommand(command)
     statusProcess.running = true
+  }
+
+  function refreshFromCache() {
+    if (!ready || statusProcess.running) return
+    _nextIsCacheOnly = true
+    statusProcess.command = pythonCommand([helperPath, "status", "--from-cache"])
+    statusProcess.running = true
+  }
+
+  function refreshIfStale(wantFull, fullMaxAgeMs) {
+    if (!ready) return
+    var nowMs = Date.now()
+    if (!fullLoaded && configured) {
+      refresh(true)
+      return
+    }
+    var ageFull = nowMs - lastFullRefreshMs
+    if (wantFull && ageFull > (fullMaxAgeMs || 300000)) {
+      refresh(true)
+      return
+    }
+    if ((nowMs - lastRefreshMs) > 15000) {
+      refresh(false)
+    }
   }
 
   function fetchRange(startDateIso, endDateIso) {
@@ -131,11 +169,35 @@ Item {
   }
 
   function stop() {
-    runAction([helperPath, "stop"], true)
+    stopAt(0, "")
+  }
+
+  function stopAt(minutesAgo, atTime) {
+    if (!ready || actionProcess.running) return
+    var prev = running
+    if (!minutesAgo && !atTime) {
+      running = null
+      note = "Stopping timer…"
+    }
+    var cmd = [helperPath, "stop"]
+    if (minutesAgo && minutesAgo > 0) cmd.push("--minutes-ago", String(minutesAgo))
+    if (atTime !== undefined && atTime !== null && String(atTime).trim() !== "") cmd.push("--at", String(atTime).trim())
+    runAction(cmd, true, false, prev)
   }
 
   function discard() {
-    runAction([helperPath, "discard"], true)
+    if (!ready || actionProcess.running) return
+    var prev = running
+    running = null
+    note = "Discarding timer…"
+    runAction([helperPath, "discard"], true, false, prev)
+  }
+
+  function splitRunning(minutesAgo, atTime) {
+    var cmd = [helperPath, "split-running"]
+    if (minutesAgo && minutesAgo > 0) cmd.push("--minutes-ago", String(minutesAgo))
+    if (atTime !== undefined && atTime !== null && String(atTime).trim() !== "") cmd.push("--at", String(atTime).trim())
+    runAction(cmd, true)
   }
 
   function updateRunning(description, projectId, taskId, tagIds, billable, adjustMinutes, startTime) {
@@ -221,6 +283,20 @@ Item {
     runAction(cmd, true)
   }
 
+  function archiveProject(projectId, archived) {
+    if (!projectId) return
+    runAction([
+      helperPath, "archive-project",
+      "--id", String(projectId),
+      "--archived", archived !== false ? "true" : "false"
+    ], true)
+  }
+
+  function deleteProject(projectId) {
+    if (!projectId) return
+    runAction([helperPath, "delete-project", "--id", String(projectId)], true)
+  }
+
   function createTask(projectId, name) {
     runAction([
       helperPath, "create-task",
@@ -229,12 +305,41 @@ Item {
     ], true)
   }
 
+  function updateTaskStatus(projectId, taskId, status) {
+    if (!projectId || !taskId) return
+    runAction([
+      helperPath, "update-task-status",
+      "--project", String(projectId),
+      "--id", String(taskId),
+      "--status", String(status || "DONE")
+    ], true)
+  }
+
+  function deleteTask(projectId, taskId) {
+    if (!projectId || !taskId) return
+    runAction([
+      helperPath, "delete-task",
+      "--project", String(projectId),
+      "--id", String(taskId)
+    ], true)
+  }
+
   function createTag(name) {
     runAction([helperPath, "create-tag", "--name", String(name || "").trim()], true)
   }
 
+  function deleteTag(tagId) {
+    if (!tagId) return
+    runAction([helperPath, "delete-tag", "--id", String(tagId)], true)
+  }
+
   function createClient(name) {
     runAction([helperPath, "create-client", "--name", String(name || "").trim()], true)
+  }
+
+  function deleteClient(clientId) {
+    if (!clientId) return
+    runAction([helperPath, "delete-client", "--id", String(clientId)], true)
   }
 
   function switchWorkspace(workspaceId) {
@@ -256,9 +361,15 @@ Item {
     if (opts.tags !== undefined) cmd.push("--tags", Array.isArray(opts.tags) ? opts.tags.join(",") : String(opts.tags))
     if (opts.billable !== undefined) cmd.push("--billable", opts.billable ? "true" : "false")
     if (opts.weekStart !== undefined) cmd.push("--week-start", String(opts.weekStart))
+    if (opts.timeStepMinutes !== undefined) cmd.push("--time-step-min", String(opts.timeStepMinutes))
+    if (opts.durationFormat !== undefined) cmd.push("--duration-format", String(opts.durationFormat))
+    if (opts.groupSimilarEntries !== undefined) cmd.push("--group-similar", opts.groupSimilarEntries ? "true" : "false")
     if (opts.pomodoro !== undefined) cmd.push("--pomodoro", opts.pomodoro ? "true" : "false")
+    if (opts.pomodoroAutoTimer !== undefined) cmd.push("--pomodoro-auto-timer", opts.pomodoroAutoTimer ? "true" : "false")
     if (opts.pomodoroWork !== undefined) cmd.push("--pomodoro-work", String(opts.pomodoroWork))
     if (opts.pomodoroBreak !== undefined) cmd.push("--pomodoro-break", String(opts.pomodoroBreak))
+    if (opts.dailyTargetHours !== undefined) cmd.push("--daily-target-hours", String(opts.dailyTargetHours))
+    if (opts.weeklyTargetHours !== undefined) cmd.push("--weekly-target-hours", String(opts.weeklyTargetHours))
     if (opts.stopOnIdle !== undefined) cmd.push("--stop-on-idle", opts.stopOnIdle ? "true" : "false")
     if (opts.idleStopMin !== undefined) cmd.push("--idle-stop-min", String(opts.idleStopMin))
     if (opts.remindWhenIdle !== undefined) cmd.push("--remind-when-idle", opts.remindWhenIdle ? "true" : "false")
@@ -296,6 +407,9 @@ Item {
     pomodoroSecondsLeft = Math.max(60, pomodoroWorkMin * 60)
     pomodoroRunning = true
     notify("Pomodoro started", "Focus session: " + pomodoroWorkMin + " min")
+    if (pomodoroAutoTimer && configured && !timing && !actionBusy) {
+      start("", defaultProjectId, defaultTaskId, defaultTagIds, defaultBillable)
+    }
   }
 
   function stopPomodoro() {
@@ -304,11 +418,28 @@ Item {
     pomodoroSecondsLeft = 0
   }
 
-  function runAction(command, expectsSnapshot, isConfigOnly, shouldSettle) {
+  function skipPomodoroPhase() {
+    if (!pomodoroRunning) return
+    if (pomodoroPhase === "work") {
+      pomodoroPhase = "break"
+      pomodoroSecondsLeft = Math.max(60, pomodoroBreakMin * 60)
+      notify("Pomodoro: Break time", "Take a " + pomodoroBreakMin + " minute break!")
+      if (pomodoroAutoTimer && timing) stop()
+    } else {
+      pomodoroPhase = "work"
+      pomodoroSecondsLeft = Math.max(60, pomodoroWorkMin * 60)
+      notify("Pomodoro: Focus session", "Starting " + pomodoroWorkMin + " min focus.")
+      if (pomodoroAutoTimer && configured && !timing && !actionBusy) {
+        start("", defaultProjectId, defaultTaskId, defaultTagIds, defaultBillable)
+      }
+    }
+  }
+
+  function runAction(command, expectsSnapshot, isConfigOnly, rollbackRunning) {
     if (!ready || actionProcess.running) return
     actionProcess.expectsSnapshot = expectsSnapshot !== false
     actionProcess.isConfigOnly = isConfigOnly === true
-    actionProcess.shouldSettle = shouldSettle !== false
+    actionProcess.preOptimisticRunning = (rollbackRunning && typeof rollbackRunning === "object") ? rollbackRunning : null
     actionProcess.command = pythonCommand(command)
     actionProcess.running = true
   }
@@ -326,9 +457,15 @@ Item {
     defaultTagIds = Array.isArray(payload.defaultTagIds) ? payload.defaultTagIds : []
     defaultBillable = payload.defaultBillable === true
     weekStart = String(payload.weekStart || "monday")
+    timeStepMinutes = Number(payload.timeStepMinutes || 5)
+    durationFormat = String(payload.durationFormat || "compact")
+    groupSimilarEntries = payload.groupSimilarEntries !== false
     pomodoroEnabled = payload.pomodoroEnabled === true
+    pomodoroAutoTimer = payload.pomodoroAutoTimer !== false
     pomodoroWorkMin = Number(payload.pomodoroWorkMin || 25)
     pomodoroBreakMin = Number(payload.pomodoroBreakMin || 5)
+    dailyTargetHours = Number(payload.dailyTargetHours !== undefined ? payload.dailyTargetHours : 8)
+    weeklyTargetHours = Number(payload.weeklyTargetHours !== undefined ? payload.weeklyTargetHours : 40)
     stopOnIdle = payload.stopOnIdle === true
     idleStopMin = Number(payload.idleStopMin || 240)
     remindWhenIdle = payload.remindWhenIdle === true
@@ -413,6 +550,7 @@ Item {
       clients = Array.isArray(payload.clients) ? payload.clients : []
       workspaceName = String(payload.workspaceName || "")
       fullLoaded = true
+      if (!root._nextIsCacheOnly) root.lastFullRefreshMs = Date.now()
     }
 
     if (!configured) {
@@ -435,23 +573,23 @@ Item {
     id: refreshTimer
     interval: root.refreshIntervalSec * 1000
     repeat: true
-    running: root.ready
+    running: root.ready && root.configured
     onTriggered: root.refresh(false)
   }
 
   Timer {
     id: firstRefresh
-    interval: 250 + Math.floor(Math.random() * 2500)
+    interval: 60
     repeat: false
     running: root.ready
-    onTriggered: root.refresh(true)
+    onTriggered: root.refreshFromCache()
   }
 
   Timer {
-    id: settleTimer
-    interval: 2200
+    id: bootLiveTimer
+    interval: 250 + Math.floor(Math.random() * 1200)
     repeat: false
-    onTriggered: root.refresh(false)
+    onTriggered: root.refresh(!root.fullLoaded)
   }
 
   Timer {
@@ -475,7 +613,7 @@ Item {
         root.pomodoroPhase = "break"
         root.pomodoroSecondsLeft = Math.max(60, root.pomodoroBreakMin * 60)
         root.notify("Pomodoro: Break time", "Take a " + root.pomodoroBreakMin + " minute break!")
-        if (root.timing) root.stop()
+        if (root.pomodoroAutoTimer && root.timing) root.stop()
       } else {
         root.pomodoroPhase = "work"
         root.pomodoroSecondsLeft = Math.max(60, root.pomodoroWorkMin * 60)
@@ -520,11 +658,17 @@ Item {
     stdout: StdioCollector { id: statusOut; waitForEnd: true }
     stderr: StdioCollector { id: statusErr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode !== 0) {
+      var wasCacheBoot = root._bootCachePending
+      root._bootCachePending = false
+      if (exitCode === 0) {
+        root.applyPayload(statusOut.text)
+      } else if (!wasCacheBoot) {
         root.lastError = root.helperFailure(statusErr.text, exitCode)
-        return
       }
-      root.applyPayload(statusOut.text)
+      root._nextIsCacheOnly = false
+      if (wasCacheBoot) {
+        bootLiveTimer.restart()
+      }
     }
   }
 
@@ -532,13 +676,16 @@ Item {
     id: actionProcess
     property bool expectsSnapshot: true
     property bool isConfigOnly: false
-    property bool shouldSettle: true
+    property var preOptimisticRunning: null
     running: false
     command: []
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
     stderr: StdioCollector { id: actionErr; waitForEnd: true }
     onExited: function(exitCode) {
+      var rollback = preOptimisticRunning
+      preOptimisticRunning = null
       if (exitCode !== 0) {
+        if (rollback !== null && root.running === null) root.running = rollback
         root.lastError = root.helperFailure(actionErr.text, exitCode)
         return
       }
@@ -548,8 +695,8 @@ Item {
       }
       if (!expectsSnapshot) return
       var parsed = root.applyPayload(actionOut.text)
-      if (shouldSettle && (!parsed || parsed.rangeOnly !== true)) {
-        settleTimer.restart()
+      if (parsed && parsed.ok === false && rollback !== null && root.running === null) {
+        root.running = rollback
       }
     }
   }

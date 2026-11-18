@@ -213,6 +213,33 @@ class ClockifyHelperTests(unittest.TestCase):
 
         const safe = ctx.neutralizeMarkup('<img src="https://x.invalid/a">');
         if (safe.includes('<') || safe.includes('>')) throw new Error('Markup not neutralized');
+
+        // Time/Date stepping, rounding, duration formatting, grouping & weekly timesheet
+        if (ctx.stepTimeHhMm('09:00', 5, now) !== '09:05') throw new Error('step +5 failed');
+        if (ctx.stepTimeHhMm('00:02', -5, now) !== '23:57') throw new Error('step wrap back failed');
+        if (ctx.stepTimeHhMm('23:58', 10, now) !== '00:08') throw new Error('step wrap fwd failed');
+        if (ctx.roundTimeHhMm('09:07', 5, now) !== '09:05') throw new Error('round down failed');
+        if (ctx.roundTimeHhMm('09:08', 5, now) !== '09:10') throw new Error('round up failed');
+        if (ctx.roundTimeHhMm('23:58', 15, now) !== '00:00') throw new Error('round midnight failed');
+        if (ctx.stepDateIso('2026-11-18', 1, now) !== '2026-11-19') throw new Error('stepDateIso +1 failed');
+        if (ctx.stepDateIso('today', -1, now) !== '2026-11-16') throw new Error('stepDateIso today -1 failed');
+        if (ctx.formatDurationByMode(5400, 'compact') !== '1h 30m') throw new Error('compact fmt failed');
+        if (ctx.formatDurationByMode(5400, 'full') !== '1:30:00') throw new Error('full fmt failed');
+        if (ctx.formatDurationByMode(5400, 'decimal') !== '1.50h') throw new Error('decimal fmt failed');
+
+        const dupEntries = [
+          {{ id: 'a1', dateIso: '2026-11-17', dateLabel: 'Today', startLocal: '09:00', endLocal: '09:30', seconds: 1800, billable: true, projectId: 'p1', projectName: 'Alpha', taskId: '', taskName: '', tagIds: [], tagNames: [], description: 'API' }},
+          {{ id: 'a2', dateIso: '2026-11-17', dateLabel: 'Today', startLocal: '11:00', endLocal: '12:00', seconds: 3600, billable: true, projectId: 'p1', projectName: 'Alpha', taskId: '', taskName: '', tagIds: [], tagNames: [], description: 'API' }}
+        ];
+        const grouped = ctx.groupSimilarDayEntries(dupEntries);
+        if (grouped.length !== 1 || grouped[0].count !== 2 || grouped[0].totalSeconds !== 5400 || grouped[0].startLocal !== '09:00' || grouped[0].endLocal !== '12:00') {{
+          throw new Error('groupSimilarDayEntries failed: ' + JSON.stringify(grouped));
+        }}
+
+        const ts = ctx.buildWeeklyTimesheet(entries, [{{ id: 'p1', name: 'Alpha', billable: true }}, {{ id: 'p2', name: 'Beta', billable: false }}], 'monday', 0, now);
+        if (ts.days.length !== 7 || ts.grandTotalSeconds !== 5400 || ts.rows.length < 2) {{
+          throw new Error('buildWeeklyTimesheet failed: ' + JSON.stringify(ts));
+        }}
         """
         proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
@@ -223,6 +250,94 @@ class ClockifyHelperTests(unittest.TestCase):
         self.assertEqual(clockify._csv_safe("-2+3"), "'-2+3")
         self.assertEqual(clockify._csv_safe("@SUM"), "'@SUM")
         self.assertEqual(clockify._csv_safe("Normal task"), "Normal task")
+
+    def test_set_config_and_time_step_preferences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                args = clockify.build_parser().parse_args([
+                    "set-config",
+                    "--time-step-min", "15",
+                    "--duration-format", "decimal",
+                    "--group-similar", "false",
+                    "--pomodoro-auto-timer", "true",
+                    "--daily-target-hours", "6.5",
+                    "--weekly-target-hours", "32",
+                ])
+                res = clockify.cmd_set_config(args)
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["timeStepMinutes"], 15)
+                self.assertEqual(res["durationFormat"], "decimal")
+                self.assertFalse(res["groupSimilarEntries"])
+                self.assertTrue(res["pomodoroAutoTimer"])
+                self.assertEqual(res["dailyTargetHours"], 6.5)
+                self.assertEqual(res["weeklyTargetHours"], 32.0)
+
+                saved = json.loads((xdg / "omarchy" / "clockify.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["timeStepMinutes"], 15)
+                self.assertEqual(saved["durationFormat"], "decimal")
+
+    def test_split_running_stops_and_starts_continuation(self):
+        ident = clockify.Identity("u1", "w1", "Tester")
+        running_entry = {
+            "id": "run1",
+            "description": "Build timesheet",
+            "projectId": "p1",
+            "taskId": "t1",
+            "tagIds": ["g1"],
+            "billable": True,
+            "timeInterval": {"start": "2026-11-17T08:00:00Z"},
+        }
+        api = mock.MagicMock()
+        api.call.return_value = {"id": "run2", "timeInterval": {"start": "2026-11-17T09:00:00Z"}}
+        stopped = {"id": "run1", "timeInterval": {"start": "2026-11-17T08:00:00Z", "end": "2026-11-17T09:00:00Z"}}
+        with mock.patch.object(clockify, "load_config", return_value={}), \
+             mock.patch.object(clockify, "open_client", return_value=(api, ident, "api-key")), \
+             mock.patch.object(clockify, "time_entries", return_value=[running_entry]), \
+             mock.patch.object(clockify, "stop_running", return_value=stopped) as mock_stop, \
+             mock.patch.object(clockify, "fast_mutation_snapshot", return_value={"ok": True, "configured": True}) as mock_fast, \
+             mock.patch.object(clockify, "remember_host"):
+            args = clockify.build_parser().parse_args(["split-running", "--minutes-ago", "10"])
+            res = clockify.cmd_split_running(args)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["note"], "Timer split into new entry")
+        mock_stop.assert_called_once()
+        api.call.assert_called_once()
+        mock_fast.assert_called_once()
+
+    def test_cache_save_and_from_cache_contains_no_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text(json.dumps({"apiKey": "super-secret-key", "workspaceId": "w1"}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                clockify.save_cache({
+                    "configured": True,
+                    "userId": "u1",
+                    "userName": "Tester",
+                    "workspaceId": "w1",
+                    "workspaceName": "Main",
+                    "projects": [{"id": "p1", "name": "Alpha", "tasks": []}],
+                    "tags": [],
+                    "clients": [],
+                    "workspaces": [{"id": "w1", "name": "Main"}],
+                    "recentEntries": [],
+                    "loadedStartDate": "2026-01-01",
+                    "loadedEndDate": "2026-11-17",
+                    "fullLoaded": True,
+                })
+                cfile = xdg / "omarchy" / "clockify-cache.json"
+                self.assertTrue(cfile.exists())
+                self.assertEqual(cfile.stat().st_mode & 0o777, 0o600)
+                raw = cfile.read_text(encoding="utf-8")
+                self.assertNotIn("super-secret-key", raw)
+                self.assertNotIn("apiKey", raw)
+
+                res = clockify.cmd_status(clockify.build_parser().parse_args(["status", "--from-cache"]))
+                self.assertTrue(res["ok"])
+                self.assertTrue(res["configured"])
+                self.assertEqual(res["projects"][0]["name"], "Alpha")
 
 
 class AuthIsolationTests(unittest.TestCase):

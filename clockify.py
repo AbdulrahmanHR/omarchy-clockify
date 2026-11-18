@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import glob
 import http.client
@@ -36,8 +37,10 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 PAGE_SIZE = 200
 PAGE_LIMIT = 5
 MAX_ENTRY_DAYS = 365
+INCREMENTAL_SYNC_DAYS = 14
 MAX_RECENT_ENTRIES = 500
 MAX_TASK_PROJECTS = 40
+CACHE_VERSION = 1
 
 
 class ApiError(Exception):
@@ -51,18 +54,27 @@ class ApiError(Exception):
 class Identity:
     """Authenticated user and active workspace."""
 
-    def __init__(self, user_id, workspace_id, user_name, user_email=""):
+    def __init__(self, user_id, workspace_id, user_name, user_email="", week_start=""):
         self.user_id = user_id
         self.workspace_id = workspace_id
         self.user_name = user_name
         self.user_email = user_email
+        self.week_start = week_start
 
 
-# ----------------------------------------------------------------- config
+# ----------------------------------------------------------------- config & cache
+
+def _xdg_omarchy_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "omarchy"
+
 
 def config_path():
-    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
-    return Path(base) / "omarchy" / "clockify.json"
+    return _xdg_omarchy_dir() / "clockify.json"
+
+
+def cache_path():
+    return _xdg_omarchy_dir() / "clockify-cache.json"
 
 
 def clockify_desktop_leveldb_dir():
@@ -70,25 +82,81 @@ def clockify_desktop_leveldb_dir():
     return Path(base) / "Clockify" / "Local Storage" / "leveldb"
 
 
-def load_config():
+def _read_json_dict(path):
     try:
-        with open(config_path(), encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def save_config(config):
-    path = config_path()
+def _write_private_json(path, data, indent=2):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2, sort_keys=True)
+        json.dump(data, handle, indent=indent, sort_keys=True)
         handle.write("\n")
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+
+
+def load_config():
+    return _read_json_dict(config_path())
+
+
+def save_config(config):
+    _write_private_json(config_path(), config, indent=2)
+
+
+def load_cache(workspace_id=""):
+    """Read non-sensitive cached workspace/entry metadata for fast startup & deltas."""
+    data = _read_json_dict(cache_path())
+    if not data or data.get("version") != CACHE_VERSION:
+        return {}
+    ws = str(workspace_id or "").strip()
+    if ws and str(data.get("workspaceId") or "") != ws:
+        return {}
+    return data
+
+
+def save_cache(payload):
+    """Persist only non-sensitive workspace metadata and history entries (never credentials)."""
+    ws_id = str(payload.get("workspaceId") or "").strip()
+    if not payload.get("configured") or not ws_id or not payload.get("userId"):
+        return
+    existing = load_cache(ws_id)
+    now_iso = utc_stamp(now_utc())
+    is_full = bool(payload.get("fullLoaded"))
+    safe_cache = {
+        "version": CACHE_VERSION,
+        "userId": str(payload.get("userId") or ""),
+        "userName": str(payload.get("userName") or ""),
+        "userEmail": str(payload.get("userEmail") or ""),
+        "workspaceId": ws_id,
+        "workspaceName": str(payload.get("workspaceName") or existing.get("workspaceName") or ""),
+        "workspaces": payload.get("workspaces") if is_full else (existing.get("workspaces") or []),
+        "projects": payload.get("projects") if is_full else (existing.get("projects") or []),
+        "tags": payload.get("tags") if is_full else (existing.get("tags") or []),
+        "clients": payload.get("clients") if is_full else (existing.get("clients") or []),
+        "recentEntries": list(payload.get("recentEntries") or [])[:MAX_RECENT_ENTRIES],
+        "loadedStartDate": str(payload.get("loadedStartDate") or existing.get("loadedStartDate") or ""),
+        "loadedEndDate": str(payload.get("loadedEndDate") or existing.get("loadedEndDate") or ""),
+        "updatedAt": now_iso,
+        "fullLoadedAt": now_iso if is_full else str(existing.get("fullLoadedAt") or ""),
+    }
+    try:
+        _write_private_json(cache_path(), safe_cache, indent=None)
+    except OSError:
+        pass
+
+
+def clear_cache():
+    try:
+        cache_path().unlink()
+    except OSError:
+        pass
 
 
 # ----------------------------------------------------- leveldb / jwt auth
@@ -255,23 +323,47 @@ def resolve_auth(config):
 class Api:
     """Resilient HTTP/1.1 client with CloudFront IP failover for api.clockify.me."""
 
-    def __init__(self, credential, header_name="X-Api-Key", preferred="", auth_source="", config=None):
+    def __init__(self, credential, header_name="X-Api-Key", preferred="", auth_source="", config=None, addresses=None, ssl_context=None):
         self.credential = credential
         self.header_name = header_name
         self.auth_source = auth_source
         self.config = config if config is not None else {}
-        self.addresses = self._resolve()
+        self.addresses = list(addresses) if addresses is not None else self._resolve()
+        self.ssl_context = ssl_context if ssl_context is not None else ssl.create_default_context()
         self.connection = None
         self.address = None
         self.preferred = str(preferred or "")
         self.good_host = ""
 
+    def clone(self):
+        """Create an independent socket client sharing DNS results and TLS context for worker threads."""
+        preferred = self.good_host or self.preferred
+        return Api(
+            self.credential,
+            self.header_name,
+            preferred,
+            auth_source=self.auth_source,
+            config=self.config,
+            addresses=self.addresses,
+            ssl_context=self.ssl_context,
+        )
+
     @staticmethod
     def _resolve():
-        try:
-            infos = socket.getaddrinfo(HOST, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        except OSError as error:
-            raise ApiError("Could not resolve %s: %s" % (HOST, error)) from error
+        # Prefer IPv4 lookup first to avoid dual-stack resolver delays (~1ms vs ~140ms).
+        infos = []
+        last_error = None
+        for family in (socket.AF_INET, socket.AF_UNSPEC):
+            try:
+                infos = socket.getaddrinfo(HOST, 443, family, socket.SOCK_STREAM)
+                if infos:
+                    break
+            except OSError as error:
+                last_error = error
+        if not infos:
+            if last_error is not None:
+                raise ApiError("Could not resolve %s: %s" % (HOST, last_error)) from last_error
+            raise ApiError("Could not resolve %s" % HOST)
         ordered = []
         for info in infos:
             address = (info[0], info[4])
@@ -285,8 +377,7 @@ class Api:
         raw = socket.socket(family, socket.SOCK_STREAM)
         raw.settimeout(TIMEOUT)
         raw.connect(sockaddr)
-        context = ssl.create_default_context()
-        secure = context.wrap_socket(raw, server_hostname=HOST)
+        secure = self.ssl_context.wrap_socket(raw, server_hostname=HOST)
         connection = http.client.HTTPSConnection(HOST, 443, timeout=TIMEOUT)
         connection.sock = secure
         return connection
@@ -467,6 +558,10 @@ def friendly_date_label(local_dt, today_date):
 
 # ------------------------------------------------------------------ reading
 
+def _worker_api(api):
+    return api.clone() if isinstance(api, Api) else api
+
+
 def identity(config, api):
     user = api.call("GET", "/user") or {}
     user_id = str(user.get("id") or "")
@@ -478,12 +573,32 @@ def identity(config, api):
     )
     if not user_id or not workspace_id:
         raise ApiError("Clockify did not return a user and workspace")
+    settings = user.get("settings") if isinstance(user.get("settings"), dict) else {}
+    raw_ws = str(settings.get("weekStart") or "").strip().lower()
+    ws_pref = raw_ws if raw_ws in ("monday", "sunday") else ""
     return Identity(
         user_id,
         workspace_id,
         str(user.get("name") or user.get("email") or ""),
         str(user.get("email") or ""),
+        week_start=ws_pref,
     )
+
+
+def fast_identity(config, api, force_network=False):
+    """Reuse cached user/workspace ids when available to avoid an extra /user round-trip."""
+    if not force_network:
+        cache = load_cache()
+        ws_id = str(config.get("workspaceId") or cache.get("workspaceId") or "")
+        user_id = str(cache.get("userId") or "")
+        if user_id and ws_id and str(cache.get("workspaceId") or "") == ws_id:
+            return Identity(
+                user_id,
+                ws_id,
+                str(cache.get("userName") or ""),
+                str(cache.get("userEmail") or ""),
+            )
+    return identity(config, api)
 
 
 def fetch_workspaces(api):
@@ -518,11 +633,11 @@ def fetch_projects_with_tasks(workspace_id, api):
             break
     projects.sort(key=lambda p: p["name"].lower())
 
-    for project in projects[:MAX_TASK_PROJECTS]:
-        if not project["id"]:
-            continue
+    targets = [p for p in projects[:MAX_TASK_PROJECTS] if p["id"]]
+
+    def _load_tasks(project, client):
         try:
-            tasks_raw = api.call(
+            tasks_raw = client.call(
                 "GET",
                 "/workspaces/%s/projects/%s/tasks" % (workspace_id, project["id"]),
                 params={"is-active": "true", "page-size": PAGE_SIZE},
@@ -541,6 +656,12 @@ def fetch_projects_with_tasks(workspace_id, api):
             project["tasks"] = tasks
         except ApiError:
             project["tasks"] = []
+
+    if len(targets) == 1:
+        _load_tasks(targets[0], api)
+    elif len(targets) > 1:
+        with ThreadPoolExecutor(max_workers=min(6, len(targets))) as pool:
+            list(pool.map(lambda p: _load_tasks(p, _worker_api(api)), targets))
     return projects
 
 
@@ -580,8 +701,8 @@ def fetch_clients(workspace_id, api):
     return clients
 
 
-def time_entries(ident, api, params):
-    query = {"hydrated": "true"}
+def time_entries(ident, api, params, hydrated=True):
+    query = {"hydrated": "true"} if hydrated else {}
     query.update(params)
     return api.call(
         "GET",
@@ -590,7 +711,7 @@ def time_entries(ident, api, params):
     ) or []
 
 
-def entry_view(entry, projects_by_id, today_date=None):
+def entry_view(entry, projects_by_id, today_date=None, tags_by_id=None):
     if today_date is None:
         today_date = datetime.now().astimezone().date()
     interval = entry.get("timeInterval") or {}
@@ -614,6 +735,8 @@ def entry_view(entry, projects_by_id, today_date=None):
     tag_names = [str(t.get("name") or "") for t in tags_raw if isinstance(t, dict) and t.get("name")]
     if not tag_ids and tags_raw:
         tag_ids = [str(t.get("id") or "") for t in tags_raw if isinstance(t, dict) and t.get("id")]
+    if not tag_names and tag_ids and tags_by_id:
+        tag_names = [str(tags_by_id[tid].get("name") or "") for tid in tag_ids if tid in tags_by_id and tags_by_id[tid].get("name")]
 
     start_local = ""
     end_local = ""
@@ -664,6 +787,19 @@ def _int_pref(config, key, default, lo, hi):
     return max(lo, min(hi, val))
 
 
+def _float_pref(config, key, default, lo, hi):
+    try:
+        val = float(config.get(key, default))
+    except (TypeError, ValueError):
+        val = default
+    return round(max(lo, min(hi, val)), 2)
+
+
+def _choice_pref(config, key, allowed, default):
+    val = str(config.get(key) or default).strip().lower()
+    return val if val in allowed else default
+
+
 def base_payload():
     return {
         "ok": True,
@@ -682,9 +818,15 @@ def base_payload():
         "defaultTagIds": [],
         "defaultBillable": False,
         "weekStart": "monday",
+        "timeStepMinutes": 5,
+        "durationFormat": "compact",
+        "groupSimilarEntries": True,
         "pomodoroEnabled": False,
+        "pomodoroAutoTimer": True,
         "pomodoroWorkMin": 25,
         "pomodoroBreakMin": 5,
+        "dailyTargetHours": 8.0,
+        "weeklyTargetHours": 40.0,
         "stopOnIdle": False,
         "idleStopMin": 240,
         "remindWhenIdle": False,
@@ -715,10 +857,16 @@ def _apply_prefs_to_payload(payload, config):
         "defaultTaskId": str(config.get("defaultTaskId") or ""),
         "defaultTagIds": [str(t) for t in (config.get("defaultTagIds") or []) if t],
         "defaultBillable": _bool_pref(config, "defaultBillable", False),
-        "weekStart": str(config.get("weekStart") or "monday"),
+        "weekStart": _choice_pref(config, "weekStart", ("monday", "sunday"), "monday"),
+        "timeStepMinutes": _int_pref(config, "timeStepMinutes", 5, 1, 60),
+        "durationFormat": _choice_pref(config, "durationFormat", ("compact", "full", "decimal"), "compact"),
+        "groupSimilarEntries": _bool_pref(config, "groupSimilarEntries", True),
         "pomodoroEnabled": _bool_pref(config, "pomodoroEnabled", False),
+        "pomodoroAutoTimer": _bool_pref(config, "pomodoroAutoTimer", True),
         "pomodoroWorkMin": _int_pref(config, "pomodoroWorkMin", 25, 1, 180),
         "pomodoroBreakMin": _int_pref(config, "pomodoroBreakMin", 5, 1, 60),
+        "dailyTargetHours": _float_pref(config, "dailyTargetHours", 8.0, 0.0, 24.0),
+        "weeklyTargetHours": _float_pref(config, "weeklyTargetHours", 40.0, 0.0, 168.0),
         "stopOnIdle": _bool_pref(config, "stopOnIdle", False),
         "idleStopMin": _int_pref(config, "idleStopMin", 240, 5, 1440),
         "remindWhenIdle": _bool_pref(config, "remindWhenIdle", False),
@@ -741,62 +889,9 @@ def _format_hms(seconds):
     return "%d:%02d:%02d" % (total // 3600, (total % 3600) // 60, total % 60)
 
 
-def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_date=""):
-    workspaces = fetch_workspaces(api) if full else []
-    projects = fetch_projects_with_tasks(ident.workspace_id, api) if full else []
-    tags = fetch_tags(ident.workspace_id, api) if full else []
-    clients = fetch_clients(ident.workspace_id, api) if full else []
-    projects_by_id = {p["id"]: p for p in projects}
-
-    local_tz = datetime.now().astimezone().tzinfo
-    today_date = datetime.now().astimezone().date()
-    running_entries = time_entries(ident, api, {"in-progress": "true"})
-    running = entry_view(running_entries[0], projects_by_id, today_date) if running_entries else None
-
-    first_day = str(config.get("weekStart") or "monday")
-    moment = now_utc()
+def _compute_period_totals(finished, moment, first_day):
     week_floor = week_start(moment, first_day)
     month_floor = local_midnight(moment).replace(day=1)
-
-    req_start = _parse_local_date(start_date) if str(start_date or "").strip() else None
-    req_end = _parse_local_date(end_date) if str(end_date or "").strip() else None
-    is_custom_range = req_start is not None or req_end is not None
-
-    if req_start is not None:
-        history_floor = datetime(req_start.year, req_start.month, req_start.day, 0, 0, 0, tzinfo=local_tz).astimezone(timezone.utc)
-    else:
-        history_floor = min(week_floor, month_floor, local_midnight(moment) - timedelta(days=MAX_ENTRY_DAYS))
-
-    if req_end is not None:
-        end_local_dt = datetime(req_end.year, req_end.month, req_end.day, 23, 59, 59, tzinfo=local_tz).astimezone(timezone.utc)
-        # Pad +2 days to work around Clockify's zoned end-filter quirk in UTC+ timezones.
-        query_end = end_local_dt + timedelta(days=2)
-    else:
-        query_end = moment + timedelta(days=2)
-
-    max_pages = 6 if is_custom_range else 4
-    raw_window = []
-    for page in range(1, max_pages):
-        batch = time_entries(ident, api, {
-            "start": utc_stamp(history_floor),
-            "end": utc_stamp(query_end),
-            "page-size": PAGE_SIZE,
-            "page": page,
-        })
-        raw_window.extend(batch)
-        if len(batch) < PAGE_SIZE:
-            break
-
-    entries = [entry_view(e, projects_by_id, today_date) for e in raw_window]
-    finished = [e for e in entries if not e["running"]]
-
-    if req_start is not None:
-        s_iso = req_start.strftime("%Y-%m-%d")
-        finished = [e for e in finished if e["dateIso"] >= s_iso]
-    if req_end is not None:
-        e_iso = req_end.strftime("%Y-%m-%d")
-        finished = [e for e in finished if e["dateIso"] <= e_iso]
-
     today_floor_dt = local_midnight(moment).astimezone(timezone.utc)
     week_floor_dt = week_floor.astimezone(timezone.utc)
     month_floor_dt = month_floor.astimezone(timezone.utc)
@@ -808,18 +903,161 @@ def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_
     today_entries = [e for e in finished if _entry_after(e, today_floor_dt)]
     week_entries = [e for e in finished if _entry_after(e, week_floor_dt)]
     month_entries = [e for e in finished if _entry_after(e, month_floor_dt)]
+    return {
+        "todaySeconds": sum(e["seconds"] for e in today_entries),
+        "weekSeconds": sum(e["seconds"] for e in week_entries),
+        "monthSeconds": sum(e["seconds"] for e in month_entries),
+        "todayBillableSeconds": sum(e["seconds"] for e in today_entries if e["billable"]),
+        "weekBillableSeconds": sum(e["seconds"] for e in week_entries if e["billable"]),
+        "monthBillableSeconds": sum(e["seconds"] for e in month_entries if e["billable"]),
+    }
 
-    workspace_name = ""
+
+def _dedupe_sort_entries(entries, today_date):
+    seen = set()
+    cleaned = []
+    for e in entries:
+        eid = str(e.get("id") or "")
+        if not eid or eid in seen or e.get("running"):
+            continue
+        seen.add(eid)
+        st = parse_stamp(e.get("start"))
+        if st:
+            e = dict(e)
+            e["dateLabel"] = friendly_date_label(st.astimezone(), today_date)
+        cleaned.append(e)
+    cleaned.sort(key=lambda item: str(item.get("start") or ""), reverse=True)
+    return cleaned[:MAX_RECENT_ENTRIES]
+
+
+def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_date="", use_cache=True):
+    cache = load_cache(ident.workspace_id) if (use_cache and ident.workspace_id) else {}
+    local_tz = datetime.now().astimezone().tzinfo
+    today_date = datetime.now().astimezone().date()
+    moment = now_utc()
+    if ident.week_start and "weekStart" not in config:
+        config["weekStart"] = ident.week_start
+        save_config(config)
+    first_day = str(config.get("weekStart") or ident.week_start or "monday")
+    week_floor = week_start(moment, first_day)
+    month_floor = local_midnight(moment).replace(day=1)
+
+    req_start = _parse_local_date(start_date) if str(start_date or "").strip() else None
+    req_end = _parse_local_date(end_date) if str(end_date or "").strip() else None
+    is_custom_range = req_start is not None or req_end is not None
+
+    can_incremental = bool(
+        use_cache
+        and not full
+        and not is_custom_range
+        and isinstance(cache.get("recentEntries"), list)
+        and cache.get("loadedStartDate")
+    )
+
+    if req_start is not None:
+        history_floor = datetime(req_start.year, req_start.month, req_start.day, 0, 0, 0, tzinfo=local_tz).astimezone(timezone.utc)
+        incr_floor_iso = ""
+    elif can_incremental:
+        incr_date = today_date - timedelta(days=INCREMENTAL_SYNC_DAYS)
+        incr_floor_iso = incr_date.strftime("%Y-%m-%d")
+        history_floor = datetime(incr_date.year, incr_date.month, incr_date.day, 0, 0, 0, tzinfo=local_tz).astimezone(timezone.utc) - timedelta(hours=12)
+    else:
+        incr_floor_iso = ""
+        history_floor = min(week_floor, month_floor, local_midnight(moment) - timedelta(days=MAX_ENTRY_DAYS))
+
+    if req_end is not None:
+        end_local_dt = datetime(req_end.year, req_end.month, req_end.day, 23, 59, 59, tzinfo=local_tz).astimezone(timezone.utc)
+        # Pad +2 days to work around Clockify's zoned end-filter quirk in UTC+ timezones.
+        query_end = end_local_dt + timedelta(days=2)
+    else:
+        query_end = moment + timedelta(days=2)
+
+    def _fetch_entries_window(client):
+        page_sz = 100 if can_incremental else PAGE_SIZE
+        max_pages = 6 if is_custom_range else (3 if can_incremental else 4)
+        out = []
+        # Skip redundant server hydration when we already have workspace project/tag metadata.
+        needs_hydration = full or not (cache.get("projects") and cache.get("tags") is not None)
+        for page in range(1, max_pages):
+            batch = time_entries(
+                ident,
+                client,
+                {
+                    "start": utc_stamp(history_floor),
+                    "end": utc_stamp(query_end),
+                    "page-size": page_sz,
+                    "page": page,
+                },
+                hydrated=needs_hydration,
+            )
+            out.extend(batch)
+            if len(batch) < page_sz:
+                break
+        return out
+
+    if full:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            f_ws = pool.submit(fetch_workspaces, _worker_api(api))
+            f_proj = pool.submit(fetch_projects_with_tasks, ident.workspace_id, _worker_api(api))
+            f_tags = pool.submit(fetch_tags, ident.workspace_id, _worker_api(api))
+            f_clients = pool.submit(fetch_clients, ident.workspace_id, _worker_api(api))
+            f_run = pool.submit(time_entries, ident, _worker_api(api), {"in-progress": "true"}, True)
+            f_hist = pool.submit(_fetch_entries_window, _worker_api(api))
+            workspaces = f_ws.result()
+            projects = f_proj.result()
+            tags = f_tags.result()
+            clients = f_clients.result()
+            running_entries = f_run.result()
+            raw_window = f_hist.result()
+    else:
+        workspaces = []
+        projects = []
+        tags = []
+        clients = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_run = pool.submit(time_entries, ident, _worker_api(api), {"in-progress": "true"}, True)
+            f_hist = pool.submit(_fetch_entries_window, _worker_api(api))
+            running_entries = f_run.result()
+            raw_window = f_hist.result()
+
+    hydrate_projects = projects if full else (cache.get("projects") or [])
+    hydrate_tags = tags if full else (cache.get("tags") or [])
+    projects_by_id = {p["id"]: p for p in hydrate_projects if p.get("id")}
+    tags_by_id = {t["id"]: t for t in hydrate_tags if t.get("id")}
+
+    running = entry_view(running_entries[0], projects_by_id, today_date, tags_by_id) if running_entries else None
+    entries = [entry_view(e, projects_by_id, today_date, tags_by_id) for e in raw_window]
+    finished = [e for e in entries if not e["running"]]
+
+    if req_start is not None:
+        s_iso = req_start.strftime("%Y-%m-%d")
+        finished = [e for e in finished if e["dateIso"] >= s_iso]
+    if req_end is not None:
+        e_iso = req_end.strftime("%Y-%m-%d")
+        finished = [e for e in finished if e["dateIso"] <= e_iso]
+
+    if can_incremental and incr_floor_iso:
+        fresh = [e for e in finished if e["dateIso"] >= incr_floor_iso]
+        older = [e for e in (cache.get("recentEntries") or []) if str(e.get("dateIso") or "") < incr_floor_iso]
+        finished = _dedupe_sort_entries(fresh + older, today_date)
+
+    workspace_name = str(cache.get("workspaceName") or "")
     for ws in workspaces:
         if ws["id"] == ident.workspace_id:
             workspace_name = ws["name"]
             break
 
-    loaded_start = req_start.strftime("%Y-%m-%d") if req_start else history_floor.astimezone().strftime("%Y-%m-%d")
+    if req_start is not None:
+        loaded_start = req_start.strftime("%Y-%m-%d")
+    elif can_incremental:
+        loaded_start = str(cache.get("loadedStartDate") or history_floor.astimezone().strftime("%Y-%m-%d"))
+    else:
+        loaded_start = history_floor.astimezone().strftime("%Y-%m-%d")
     loaded_end = req_end.strftime("%Y-%m-%d") if req_end else today_date.strftime("%Y-%m-%d")
 
     payload = base_payload()
     _apply_prefs_to_payload(payload, config)
+    payload.update(_compute_period_totals(finished, moment, first_day))
     payload.update({
         "configured": True,
         "authSource": auth_source,
@@ -831,12 +1069,6 @@ def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_
         "workspaces": workspaces,
         "running": running,
         "recentEntries": finished[:MAX_RECENT_ENTRIES],
-        "todaySeconds": sum(e["seconds"] for e in today_entries),
-        "weekSeconds": sum(e["seconds"] for e in week_entries),
-        "monthSeconds": sum(e["seconds"] for e in month_entries),
-        "todayBillableSeconds": sum(e["seconds"] for e in today_entries if e["billable"]),
-        "weekBillableSeconds": sum(e["seconds"] for e in week_entries if e["billable"]),
-        "monthBillableSeconds": sum(e["seconds"] for e in month_entries if e["billable"]),
         "loadedStartDate": loaded_start,
         "loadedEndDate": loaded_end,
         "rangeOnly": is_custom_range,
@@ -846,21 +1078,96 @@ def snapshot(config, api, ident, full=False, auth_source="", start_date="", end_
         "fullLoaded": bool(full),
         "fetchedAt": utc_stamp(moment),
     })
+    if use_cache and not is_custom_range:
+        save_cache(payload)
     return payload
 
 
-def stop_running(ident, api):
+_UNSET = object()
+
+
+def fast_mutation_snapshot(
+    config,
+    api,
+    ident,
+    auth_source="",
+    running_raw=_UNSET,
+    upserted_raws=None,
+    deleted_ids=None,
+):
+    """Apply a mutation directly onto warm cache; fall back to snapshot() on cold cache."""
+    cache = load_cache(ident.workspace_id)
+    if not cache or not cache.get("loadedStartDate"):
+        return snapshot(config, api, ident, auth_source=auth_source)
+
+    today_date = datetime.now().astimezone().date()
+    moment = now_utc()
+    first_day = str(config.get("weekStart") or "monday")
+    projects_by_id = {p["id"]: p for p in (cache.get("projects") or []) if p.get("id")}
+    tags_by_id = {t["id"]: t for t in (cache.get("tags") or []) if t.get("id")}
+
+    entries = list(cache.get("recentEntries") or [])
+    remove_set = {str(x) for x in (deleted_ids or []) if x}
+    if remove_set:
+        entries = [e for e in entries if str(e.get("id") or "") not in remove_set]
+
+    new_views = []
+    for raw in (upserted_raws or []):
+        if isinstance(raw, dict) and raw.get("id"):
+            view = entry_view(raw, projects_by_id, today_date, tags_by_id)
+            if not view["running"]:
+                new_views.append(view)
+                remove_set.add(view["id"])
+    if remove_set:
+        entries = [e for e in entries if str(e.get("id") or "") not in remove_set]
+    finished = _dedupe_sort_entries(new_views + entries, today_date)
+
+    if running_raw is None:
+        running = None
+    elif running_raw is _UNSET:
+        in_prog = time_entries(ident, api, {"in-progress": "true"})
+        running = entry_view(in_prog[0], projects_by_id, today_date, tags_by_id) if in_prog else None
+    elif isinstance(running_raw, dict) and running_raw.get("id"):
+        running = entry_view(running_raw, projects_by_id, today_date, tags_by_id)
+    else:
+        in_prog = time_entries(ident, api, {"in-progress": "true"})
+        running = entry_view(in_prog[0], projects_by_id, today_date, tags_by_id) if in_prog else None
+
+    payload = base_payload()
+    _apply_prefs_to_payload(payload, config)
+    payload.update(_compute_period_totals(finished, moment, first_day))
+    payload.update({
+        "configured": True,
+        "authSource": auth_source,
+        "userId": ident.user_id,
+        "userName": ident.user_name,
+        "userEmail": ident.user_email,
+        "workspaceId": ident.workspace_id,
+        "workspaceName": str(cache.get("workspaceName") or ""),
+        "running": running,
+        "recentEntries": finished,
+        "loadedStartDate": str(cache.get("loadedStartDate") or ""),
+        "loadedEndDate": today_date.strftime("%Y-%m-%d"),
+        "rangeOnly": False,
+        "fullLoaded": False,
+        "fetchedAt": utc_stamp(moment),
+    })
+    save_cache(payload)
+    return payload
+
+
+def stop_running(ident, api, end_dt=None):
     try:
-        api.call(
+        res = api.call(
             "PATCH",
             "/workspaces/%s/user/%s/time-entries" % (ident.workspace_id, ident.user_id),
-            body={"end": utc_stamp(now_utc())},
+            body={"end": utc_stamp(end_dt or now_utc())},
         )
+        return res if isinstance(res, dict) else {}
     except ApiError as error:
         if error.code == 404:
-            return False
+            return None
         raise
-    return True
 
 
 def _parse_tag_csv(raw):
@@ -874,12 +1181,12 @@ def _parse_tag_csv(raw):
 
 # ---------------------------------------------------------------- commands
 
-def open_client(config):
+def open_client(config, force_identity=False):
     cred, header, source = resolve_auth(config)
     if not cred:
         return None, None, ""
     api = Api(cred, header, str(config.get("apiHost") or ""), auth_source=source, config=config)
-    return api, identity(config, api), source
+    return api, fast_identity(config, api, force_network=force_identity), source
 
 
 def remember_host(config, api):
@@ -896,9 +1203,57 @@ def unconfigured(config, note=""):
     return payload
 
 
+def _payload_from_cache(config, cred_source):
+    ws_id = str(config.get("workspaceId") or "").strip()
+    cache = load_cache(ws_id)
+    if not cache or not cache.get("userId") or not cache.get("workspaceId"):
+        return None
+    today_date = datetime.now().astimezone().date()
+    moment = now_utc()
+    first_day = str(config.get("weekStart") or "monday")
+    finished = _dedupe_sort_entries(list(cache.get("recentEntries") or []), today_date)
+    projects = list(cache.get("projects") or [])
+    tags = list(cache.get("tags") or [])
+    clients = list(cache.get("clients") or [])
+    workspaces = list(cache.get("workspaces") or [])
+    has_full = bool(projects or workspaces)
+
+    payload = base_payload()
+    _apply_prefs_to_payload(payload, config)
+    payload.update(_compute_period_totals(finished, moment, first_day))
+    payload.update({
+        "configured": True,
+        "authSource": cred_source,
+        "userId": str(cache.get("userId") or ""),
+        "userName": str(cache.get("userName") or ""),
+        "userEmail": str(cache.get("userEmail") or ""),
+        "workspaceId": str(cache.get("workspaceId") or ""),
+        "workspaceName": str(cache.get("workspaceName") or ""),
+        "workspaces": workspaces,
+        "running": None,
+        "recentEntries": finished,
+        "loadedStartDate": str(cache.get("loadedStartDate") or ""),
+        "loadedEndDate": str(cache.get("loadedEndDate") or ""),
+        "rangeOnly": False,
+        "projects": projects,
+        "tags": tags,
+        "clients": clients,
+        "fullLoaded": has_full,
+        "fetchedAt": str(cache.get("updatedAt") or ""),
+    })
+    return payload
+
+
 def cmd_status(args):
     config = load_config()
-    api, ident, source = open_client(config)
+    if getattr(args, "from_cache", False):
+        cred, _, source = resolve_auth(config)
+        if not cred:
+            return unconfigured(config)
+        cached_payload = _payload_from_cache(config, source)
+        if cached_payload is not None:
+            return cached_payload
+    api, ident, source = open_client(config, force_identity=bool(args.full))
     if not api:
         return unconfigured(config)
     payload = snapshot(
@@ -1011,7 +1366,7 @@ def cmd_start(args):
     api, ident, source = open_client(config)
     if not api:
         return unconfigured(config)
-    stop_running(ident, api)
+    stopped_raw = stop_running(ident, api)
 
     start_dt = parse_user_datetime(args.start) if args.start else now_utc()
     body = {"start": utc_stamp(start_dt)}
@@ -1037,7 +1392,7 @@ def cmd_start(args):
     elif _bool_pref(config, "defaultBillable", False):
         body["billable"] = True
 
-    api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
+    created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
 
     changed = False
     if args.project is not None and project_id != str(config.get("defaultProjectId") or ""):
@@ -1053,7 +1408,14 @@ def cmd_start(args):
     if changed:
         save_config(config)
 
-    payload = snapshot(config, api, ident, auth_source=source)
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        running_raw=created_raw,
+        upserted_raws=[stopped_raw] if stopped_raw else None,
+    )
     payload["note"] = "Timer started"
     remember_host(config, api)
     return payload
@@ -1064,9 +1426,32 @@ def cmd_stop(args):
     api, ident, source = open_client(config)
     if not api:
         return unconfigured(config)
-    stopped = stop_running(ident, api)
-    payload = snapshot(config, api, ident, auth_source=source)
-    if stopped:
+    at_val = getattr(args, "at", None)
+    mins_ago = getattr(args, "minutes_ago", 0) or 0
+    end_dt = None
+    if at_val or mins_ago > 0:
+        running_entries = time_entries(ident, api, {"in-progress": "true"})
+        if not running_entries:
+            payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
+            payload["error"] = "No timer is running"
+            return payload
+        orig_start = parse_stamp((running_entries[0].get("timeInterval") or {}).get("start"))
+        end_dt = parse_user_datetime(at_val, fallback_dt=orig_start) if at_val else (now_utc() - timedelta(minutes=int(mins_ago)))
+        if end_dt > now_utc():
+            end_dt = now_utc()
+        if orig_start and end_dt <= orig_start:
+            raise ApiError("Stop time must be after timer start time")
+
+    stopped_raw = stop_running(ident, api, end_dt=end_dt)
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        running_raw=None,
+        upserted_raws=[stopped_raw] if stopped_raw else None,
+    )
+    if stopped_raw is not None:
         payload["note"] = "Timer stopped"
     else:
         payload["error"] = "No timer is running"
@@ -1081,13 +1466,67 @@ def cmd_discard(args):
         return unconfigured(config)
     running_entries = time_entries(ident, api, {"in-progress": "true"})
     if not running_entries:
-        payload = snapshot(config, api, ident, auth_source=source)
+        payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
         payload["error"] = "No timer is running"
         return payload
     entry_id = str(running_entries[0].get("id") or "")
     api.call("DELETE", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, entry_id))
-    payload = snapshot(config, api, ident, auth_source=source)
+    payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None, deleted_ids=[entry_id])
     payload["note"] = "Running timer discarded"
+    remember_host(config, api)
+    return payload
+
+
+def cmd_split_running(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    running_entries = time_entries(ident, api, {"in-progress": "true"})
+    if not running_entries:
+        payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
+        payload["error"] = "No timer is running"
+        return payload
+    existing = running_entries[0]
+    orig_start = parse_stamp((existing.get("timeInterval") or {}).get("start"))
+    at_val = getattr(args, "at", None)
+    mins_ago = getattr(args, "minutes_ago", 0) or 0
+    if at_val:
+        split_dt = parse_user_datetime(at_val, fallback_dt=orig_start)
+    elif mins_ago > 0:
+        split_dt = now_utc() - timedelta(minutes=int(mins_ago))
+    else:
+        split_dt = now_utc()
+    now = now_utc()
+    if split_dt > now:
+        split_dt = now
+    if orig_start and split_dt <= orig_start:
+        raise ApiError("Split time must be after running timer start time")
+
+    stopped_raw = stop_running(ident, api, end_dt=split_dt)
+    new_body = {
+        "start": utc_stamp(split_dt),
+        "description": str(existing.get("description") or "").strip(),
+        "billable": bool(existing.get("billable")),
+    }
+    if existing.get("projectId"):
+        new_body["projectId"] = existing["projectId"]
+        if existing.get("taskId"):
+            new_body["taskId"] = existing["taskId"]
+    tag_ids = [str(t) for t in (existing.get("tagIds") or []) if t]
+    if tag_ids:
+        new_body["tagIds"] = tag_ids
+    created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=new_body)
+
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        running_raw=created_raw,
+        upserted_raws=[stopped_raw] if stopped_raw else None,
+    )
+    payload["note"] = "Timer split into new entry"
     remember_host(config, api)
     return payload
 
@@ -1151,14 +1590,14 @@ def cmd_update_running(args):
         return unconfigured(config)
     running_entries = time_entries(ident, api, {"in-progress": "true"})
     if not running_entries:
-        payload = snapshot(config, api, ident, auth_source=source)
+        payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
         payload["error"] = "No timer is running"
         return payload
     existing = running_entries[0]
     entry_id = str(existing.get("id") or "")
     body = _build_entry_put_body(existing, args, keep_running=True)
-    api.call("PUT", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, entry_id), body=body)
-    payload = snapshot(config, api, ident, auth_source=source)
+    updated_raw = api.call("PUT", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, entry_id), body=body)
+    payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=updated_raw)
     payload["note"] = "Running timer updated"
     remember_host(config, api)
     return payload
@@ -1192,8 +1631,14 @@ def cmd_add_manual(args):
     if tag_ids:
         body["tagIds"] = tag_ids
 
-    api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
-    payload = snapshot(config, api, ident, auth_source=source)
+    created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        upserted_raws=[created_raw] if isinstance(created_raw, dict) else None,
+    )
     payload["note"] = "Manual entry logged"
     remember_host(config, api)
     return payload
@@ -1205,7 +1650,7 @@ def cmd_continue_entry(args):
     if not api:
         return unconfigured(config)
     existing = api.call("GET", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id)) or {}
-    stop_running(ident, api)
+    stopped_raw = stop_running(ident, api)
     body = {
         "start": utc_stamp(now_utc()),
         "description": str(existing.get("description") or "").strip(),
@@ -1221,8 +1666,15 @@ def cmd_continue_entry(args):
     if tag_ids:
         body["tagIds"] = tag_ids
 
-    api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
-    payload = snapshot(config, api, ident, auth_source=source)
+    created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        running_raw=created_raw,
+        upserted_raws=[stopped_raw] if stopped_raw else None,
+    )
     payload["note"] = "Continued time entry"
     remember_host(config, api)
     return payload
@@ -1233,8 +1685,9 @@ def cmd_duplicate_entry(args):
     api, ident, source = open_client(config)
     if not api:
         return unconfigured(config)
+    created_raw = None
     try:
-        api.call("POST", "/workspaces/%s/user/%s/time-entries/%s/duplicate" % (ident.workspace_id, ident.user_id, args.id))
+        created_raw = api.call("POST", "/workspaces/%s/user/%s/time-entries/%s/duplicate" % (ident.workspace_id, ident.user_id, args.id))
     except ApiError as err:
         if err.code not in (404, 405):
             raise
@@ -1254,9 +1707,15 @@ def cmd_duplicate_entry(args):
                 body["taskId"] = existing["taskId"]
         if existing.get("tagIds"):
             body["tagIds"] = existing["tagIds"]
-        api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
+        created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
 
-    payload = snapshot(config, api, ident, auth_source=source)
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        upserted_raws=[created_raw] if isinstance(created_raw, dict) else None,
+    )
     payload["note"] = "Entry duplicated"
     remember_host(config, api)
     return payload
@@ -1269,8 +1728,14 @@ def cmd_update_entry(args):
         return unconfigured(config)
     existing = api.call("GET", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id)) or {}
     body = _build_entry_put_body(existing, args, keep_running=False)
-    api.call("PUT", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id), body=body)
-    payload = snapshot(config, api, ident, auth_source=source)
+    updated_raw = api.call("PUT", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id), body=body)
+    payload = fast_mutation_snapshot(
+        config,
+        api,
+        ident,
+        auth_source=source,
+        upserted_raws=[updated_raw] if isinstance(updated_raw, dict) else None,
+    )
     payload["note"] = "Entry updated"
     remember_host(config, api)
     return payload
@@ -1282,7 +1747,7 @@ def cmd_delete_entry(args):
     if not api:
         return unconfigured(config)
     api.call("DELETE", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id))
-    payload = snapshot(config, api, ident, auth_source=source)
+    payload = fast_mutation_snapshot(config, api, ident, auth_source=source, deleted_ids=[str(args.id)])
     payload["note"] = "Entry deleted"
     remember_host(config, api)
     return payload
@@ -1316,6 +1781,72 @@ def cmd_create_project(args):
     return payload
 
 
+def cmd_archive_project(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    proj_id = str(args.id or "").strip()
+    if not proj_id:
+        raise ApiError("Project id cannot be empty")
+    archived = _parse_bool_arg(args.archived) if args.archived is not None else True
+    existing = api.call("GET", "/workspaces/%s/projects/%s" % (ident.workspace_id, proj_id)) or {}
+    body = {
+        "name": str(existing.get("name") or "Project"),
+        "isPublic": bool(existing.get("public", True)),
+        "billable": bool(existing.get("billable", False)),
+        "color": str(existing.get("color") or "#039BE5"),
+        "archived": bool(archived),
+    }
+    if existing.get("clientId"):
+        body["clientId"] = str(existing["clientId"])
+    api.call("PUT", "/workspaces/%s/projects/%s" % (ident.workspace_id, proj_id), body=body)
+    if archived and proj_id == str(config.get("defaultProjectId") or ""):
+        config["defaultProjectId"] = ""
+        config["defaultTaskId"] = ""
+        save_config(config)
+    payload = snapshot(config, api, ident, full=True, auth_source=source)
+    payload["note"] = "Project archived" if archived else "Project restored"
+    remember_host(config, api)
+    return payload
+
+
+def cmd_delete_project(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    proj_id = str(args.id or "").strip()
+    if not proj_id:
+        raise ApiError("Project id cannot be empty")
+    try:
+        api.call("DELETE", "/workspaces/%s/projects/%s" % (ident.workspace_id, proj_id))
+    except ApiError as err:
+        if err.code != 400:
+            raise
+        existing = api.call("GET", "/workspaces/%s/projects/%s" % (ident.workspace_id, proj_id)) or {}
+        api.call(
+            "PUT",
+            "/workspaces/%s/projects/%s" % (ident.workspace_id, proj_id),
+            body={
+                "name": str(existing.get("name") or "Project"),
+                "isPublic": bool(existing.get("public", True)),
+                "billable": bool(existing.get("billable", False)),
+                "color": str(existing.get("color") or "#039BE5"),
+                "archived": True,
+            },
+        )
+        api.call("DELETE", "/workspaces/%s/projects/%s" % (ident.workspace_id, proj_id))
+    if proj_id == str(config.get("defaultProjectId") or ""):
+        config["defaultProjectId"] = ""
+        config["defaultTaskId"] = ""
+        save_config(config)
+    payload = snapshot(config, api, ident, full=True, auth_source=source)
+    payload["note"] = "Project deleted"
+    remember_host(config, api)
+    return payload
+
+
 def cmd_create_task(args):
     config = load_config()
     api, ident, source = open_client(config)
@@ -1342,6 +1873,42 @@ def cmd_create_task(args):
     return payload
 
 
+def cmd_update_task_status(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    proj_id = str(args.project or "").strip()
+    task_id = str(args.id or "").strip()
+    status = str(args.status or "ACTIVE").strip().upper()
+    existing = api.call("GET", "/workspaces/%s/projects/%s/tasks/%s" % (ident.workspace_id, proj_id, task_id)) or {}
+    body = {"name": str(existing.get("name") or "Task"), "status": status}
+    if existing.get("assigneeIds"):
+        body["assigneeIds"] = existing["assigneeIds"]
+    api.call("PUT", "/workspaces/%s/projects/%s/tasks/%s" % (ident.workspace_id, proj_id, task_id), body=body)
+    payload = snapshot(config, api, ident, full=True, auth_source=source)
+    payload["note"] = "Task marked %s" % status.lower()
+    remember_host(config, api)
+    return payload
+
+
+def cmd_delete_task(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    proj_id = str(args.project or "").strip()
+    task_id = str(args.id or "").strip()
+    api.call("DELETE", "/workspaces/%s/projects/%s/tasks/%s" % (ident.workspace_id, proj_id, task_id))
+    if task_id == str(config.get("defaultTaskId") or ""):
+        config["defaultTaskId"] = ""
+        save_config(config)
+    payload = snapshot(config, api, ident, full=True, auth_source=source)
+    payload["note"] = "Task deleted"
+    remember_host(config, api)
+    return payload
+
+
 def cmd_create_tag(args):
     config = load_config()
     api, ident, source = open_client(config)
@@ -1353,6 +1920,23 @@ def cmd_create_tag(args):
     api.call("POST", "/workspaces/%s/tags" % ident.workspace_id, body={"name": name})
     payload = snapshot(config, api, ident, full=True, auth_source=source)
     payload["note"] = "Tag created: %s" % name
+    remember_host(config, api)
+    return payload
+
+
+def cmd_delete_tag(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    tag_id = str(args.id or "").strip()
+    api.call("DELETE", "/workspaces/%s/tags/%s" % (ident.workspace_id, tag_id))
+    default_tags = [str(t) for t in (config.get("defaultTagIds") or []) if str(t) != tag_id]
+    if default_tags != (config.get("defaultTagIds") or []):
+        config["defaultTagIds"] = default_tags
+        save_config(config)
+    payload = snapshot(config, api, ident, full=True, auth_source=source)
+    payload["note"] = "Tag deleted"
     remember_host(config, api)
     return payload
 
@@ -1372,6 +1956,19 @@ def cmd_create_client(args):
     return payload
 
 
+def cmd_delete_client(args):
+    config = load_config()
+    api, ident, source = open_client(config)
+    if not api:
+        return unconfigured(config)
+    client_id = str(args.id or "").strip()
+    api.call("DELETE", "/workspaces/%s/clients/%s" % (ident.workspace_id, client_id))
+    payload = snapshot(config, api, ident, full=True, auth_source=source)
+    payload["note"] = "Client deleted"
+    remember_host(config, api)
+    return payload
+
+
 def cmd_switch_workspace(args):
     config = load_config()
     ws_id = str(args.workspace or "").strip()
@@ -1382,8 +1979,9 @@ def cmd_switch_workspace(args):
     config["defaultTaskId"] = ""
     config["defaultTagIds"] = []
     save_config(config)
+    clear_cache()
 
-    api, ident, source = open_client(config)
+    api, ident, source = open_client(config, force_identity=True)
     if not api:
         return unconfigured(config)
     payload = snapshot(config, api, ident, full=True, auth_source=source)
@@ -1408,7 +2006,10 @@ def cmd_set_key(args):
     config.pop("desktopAccessToken", None)
     config.pop("desktopRefreshToken", None)
     config["workspaceId"] = ident.workspace_id
+    if ident.week_start and "weekStart" not in config:
+        config["weekStart"] = ident.week_start
     save_config(config)
+    clear_cache()
 
     payload = snapshot(config, api, ident, full=True, auth_source="api-key")
     payload["note"] = "Connected via API key as %s" % (ident.user_name or "Clockify user")
@@ -1429,7 +2030,10 @@ def cmd_connect_desktop(args):
     config.pop("desktopAccessToken", None)
     config.pop("desktopRefreshToken", None)
     config["workspaceId"] = ident.workspace_id
+    if ident.week_start and "weekStart" not in config:
+        config["weekStart"] = ident.week_start
     save_config(config)
+    clear_cache()
 
     payload = snapshot(config, api, ident, full=True, auth_source="desktop-app")
     payload["note"] = "Connected to Clockify Desktop session"
@@ -1444,6 +2048,7 @@ def cmd_clear_key(args):
     config.pop("desktopAccessToken", None)
     config.pop("desktopRefreshToken", None)
     save_config(config)
+    clear_cache()
     return unconfigured(config, note="Disconnected")
 
 
@@ -1474,12 +2079,24 @@ def cmd_set_config(args):
         config["workspaceId"] = str(args.workspace).strip()
     if args.week_start is not None:
         config["weekStart"] = str(args.week_start).strip().lower()
+    if args.time_step_min is not None:
+        config["timeStepMinutes"] = max(1, min(60, int(args.time_step_min)))
+    if args.duration_format is not None:
+        config["durationFormat"] = str(args.duration_format).strip().lower()
+    if args.group_similar is not None:
+        config["groupSimilarEntries"] = _parse_bool_arg(args.group_similar)
     if args.pomodoro is not None:
         config["pomodoroEnabled"] = _parse_bool_arg(args.pomodoro)
+    if args.pomodoro_auto_timer is not None:
+        config["pomodoroAutoTimer"] = _parse_bool_arg(args.pomodoro_auto_timer)
     if args.pomodoro_work is not None:
         config["pomodoroWorkMin"] = max(1, min(180, int(args.pomodoro_work)))
     if args.pomodoro_break is not None:
         config["pomodoroBreakMin"] = max(1, min(60, int(args.pomodoro_break)))
+    if args.daily_target_hours is not None:
+        config["dailyTargetHours"] = round(max(0.0, min(24.0, float(args.daily_target_hours))), 2)
+    if args.weekly_target_hours is not None:
+        config["weeklyTargetHours"] = round(max(0.0, min(168.0, float(args.weekly_target_hours))), 2)
     if args.stop_on_idle is not None:
         config["stopOnIdle"] = _parse_bool_arg(args.stop_on_idle)
     if args.idle_stop_min is not None:
@@ -1506,6 +2123,7 @@ def build_parser():
 
     status = commands.add_parser("status", help="current timer, totals, recent entries, and optional workspace metadata")
     status.add_argument("--full", "--projects", dest="full", action="store_true", help="include workspaces, projects, tasks, tags, clients")
+    status.add_argument("--from-cache", action="store_true", help="return cached workspace metadata and recent history without network I/O")
     status.add_argument("--start-date", default="", help="optional YYYY-MM-DD start date")
     status.add_argument("--end-date", default="", help="optional YYYY-MM-DD end date")
     status.set_defaults(handler=cmd_status)
@@ -1532,10 +2150,17 @@ def build_parser():
     start.set_defaults(handler=cmd_start)
 
     stop = commands.add_parser("stop", help="stop the running entry")
+    stop.add_argument("--minutes-ago", type=int, default=0)
+    stop.add_argument("--at", default=None, help="optional HH:MM or ISO stop time")
     stop.set_defaults(handler=cmd_stop)
 
     discard = commands.add_parser("discard", help="delete the currently running entry without saving")
     discard.set_defaults(handler=cmd_discard)
+
+    split = commands.add_parser("split-running", help="split the running timer at now or an earlier time")
+    split.add_argument("--minutes-ago", type=int, default=0)
+    split.add_argument("--at", default=None)
+    split.set_defaults(handler=cmd_split_running)
 
     up_run = commands.add_parser("update-running", help="live-edit the currently running entry")
     up_run.add_argument("--description", default=None)
@@ -1595,18 +2220,46 @@ def build_parser():
     c_proj.add_argument("--private", dest="public", action="store_false")
     c_proj.set_defaults(handler=cmd_create_project)
 
+    a_proj = commands.add_parser("archive-project", help="archive or restore a project")
+    a_proj.add_argument("--id", required=True)
+    a_proj.add_argument("--archived", default="true")
+    a_proj.set_defaults(handler=cmd_archive_project)
+
+    d_proj = commands.add_parser("delete-project", help="delete a project")
+    d_proj.add_argument("--id", required=True)
+    d_proj.set_defaults(handler=cmd_delete_project)
+
     c_task = commands.add_parser("create-task", help="create a task on a project")
     c_task.add_argument("--project", required=True)
     c_task.add_argument("--name", required=True)
     c_task.set_defaults(handler=cmd_create_task)
 
+    u_task = commands.add_parser("update-task-status", help="mark a project task ACTIVE or DONE")
+    u_task.add_argument("--project", required=True)
+    u_task.add_argument("--id", required=True)
+    u_task.add_argument("--status", required=True, choices=["ACTIVE", "DONE"])
+    u_task.set_defaults(handler=cmd_update_task_status)
+
+    d_task = commands.add_parser("delete-task", help="delete a project task")
+    d_task.add_argument("--project", required=True)
+    d_task.add_argument("--id", required=True)
+    d_task.set_defaults(handler=cmd_delete_task)
+
     c_tag = commands.add_parser("create-tag", help="create a workspace tag")
     c_tag.add_argument("--name", required=True)
     c_tag.set_defaults(handler=cmd_create_tag)
 
+    d_tag = commands.add_parser("delete-tag", help="delete a workspace tag")
+    d_tag.add_argument("--id", required=True)
+    d_tag.set_defaults(handler=cmd_delete_tag)
+
     c_client = commands.add_parser("create-client", help="create a workspace client")
     c_client.add_argument("--name", required=True)
     c_client.set_defaults(handler=cmd_create_client)
+
+    d_client = commands.add_parser("delete-client", help="delete a workspace client")
+    d_client.add_argument("--id", required=True)
+    d_client.set_defaults(handler=cmd_delete_client)
 
     sw_ws = commands.add_parser("switch-workspace", help="switch active workspace")
     sw_ws.add_argument("--workspace", required=True)
@@ -1628,9 +2281,15 @@ def build_parser():
     set_cfg.add_argument("--billable", default=None)
     set_cfg.add_argument("--workspace", default=None)
     set_cfg.add_argument("--week-start", default=None, choices=["monday", "sunday"])
+    set_cfg.add_argument("--time-step-min", type=int, default=None)
+    set_cfg.add_argument("--duration-format", default=None, choices=["compact", "full", "decimal"])
+    set_cfg.add_argument("--group-similar", default=None)
     set_cfg.add_argument("--pomodoro", default=None)
+    set_cfg.add_argument("--pomodoro-auto-timer", default=None)
     set_cfg.add_argument("--pomodoro-work", type=int, default=None)
     set_cfg.add_argument("--pomodoro-break", type=int, default=None)
+    set_cfg.add_argument("--daily-target-hours", type=float, default=None)
+    set_cfg.add_argument("--weekly-target-hours", type=float, default=None)
     set_cfg.add_argument("--stop-on-idle", default=None)
     set_cfg.add_argument("--idle-stop-min", type=int, default=None)
     set_cfg.add_argument("--remind-when-idle", default=None)

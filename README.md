@@ -8,11 +8,12 @@ A full-featured [Clockify](https://clockify.me) time tracker, analytics dashboar
 
 - **Live bar pill.** Shows the Clockify icon dimmed when idle, or live `H:MM:SS` elapsed time (and optional active task label) while a timer runs. Hover for task, project, elapsed time, today's total, and this week's total. Left-click opens the panel, right-click toggles start/stop, middle-click refreshes.
 - **Personal API Key or Explicit Clockify Desktop Opt-In.** Store a personal API key (`0600` in `~/.config/omarchy/clockify.json` or `$CLOCKIFY_API_KEY`), or explicitly click **Use Clockify Desktop Session** to read your active Clockify Desktop access token in memory without refreshing or copying tokens to disk.
-- **Full Timer & Running Entry Control.** Start, switch, stop, or discard timers. Live-edit the currently running entry's description, project, task, tags, billability, start `HH:MM`, or `-5m` / `+5m` offsets without stopping it.
-- **Manual Time Entry & Quick Resume.** Switch between live Timer mode and Manual Entry mode (`today`, `yesterday`, or `YYYY-MM-DD` with start/end `HH:MM`), or click recent entry chips to prefill your next entry.
-- **Interactive Analytics Dashboard.** Browse `Day`, `Week`, `Month`, `Year`, `All`, or `Custom` date ranges with `‹` / `›` period stepping, 4 KPI cards (Total, Billable %, Daily Average, Top Project), an interactive hourly/daily/monthly activity bar chart (click any day bar to drill into that day), a stacked distribution bar and clickable breakdown (`By Project`, `By Task`, `By Tag`, `By Day`), multi-filter controls (Project, Task, Tag, Billable status, Search text), date-grouped entry rows (`Continue`, `Edit`, `Duplicate`, `Delete`), and one-click CSV export to `~/Downloads/`.
-- **Workspace & Resource Management.** Create new **Projects** (with client, color swatch, billable/public flags), **Tasks**, **Tags**, and **Clients** directly from the Manage tab, and switch between Clockify **Workspaces**.
-- **Pomodoro & Idle Automation.** Built-in Pomodoro focus/break cycle with desktop notifications (automatically stops the timer on break) plus optional idle reminder notifications and auto-stop limits for forgotten timers.
+- **Full Timer & Running Entry Control.** Start, switch, stop, split (`Split`), or discard timers. Live-edit the currently running entry's description, project, task, tags, billability, start `HH:MM` (with `▲`/`▼` arrows, Up/Down keys, or wheel stepping), `±step` / `±1m` offsets, or **Stop -Xm** without stopping first.
+- **Manual Time Entry, Time Steppers & Weekly Timesheet.** Switch between **Timer**, **Manual Entry** (`DateSpinField` + `TimeSpinField` with configurable minute step and one-click rounding, plus `Shift` for `±1m` and `Ctrl` for `±1h`), and **Timesheet** (7-day project matrix with daily totals and click-to-log cells). Track daily and weekly hour targets directly on the Today / Week summary cards.
+- **Interactive Analytics Dashboard.** Browse `Day`, `Week`, `Month`, `Year`, `All`, or `Custom` date ranges with `‹` / `›` period stepping, configurable duration display (`Compact`, `Full`, `Decimal`), toggleable grouping of identical same-day entries (`N×` badge with expandable rows), 4 KPI cards, an interactive activity bar chart, a stacked distribution bar (`By Project`, `By Task`, `By Tag`, `By Day`), multi-filter controls, paginated date groups, and CSV export to `~/Downloads/`.
+- **Workspace & Resource Management.** Filter, create, start from, archive, mark tasks Done, or delete **Projects**, **Tasks**, **Tags**, and **Clients** from the Manage tab, and switch between Clockify **Workspaces**.
+- **Pomodoro & Idle Automation.** Built-in Pomodoro focus/break cycle with optional timer auto-sync (`Start` starts focus timer, `Break` stops it, `Skip` jumps phase) plus idle reminder notifications and auto-stop limits for forgotten timers.
+- **Fast Caching & Parallel Sync.** Non-sensitive metadata and recent entries cache (`0600` in `~/.config/omarchy/clockify-cache.json`) gives instant startup prefill, 14-day incremental background sync, parallel `--full` fetching, and single-request mutation updates.
 
 ## Install
 
@@ -71,7 +72,9 @@ Direct CLI usage:
 ./clockify.py status --full | jq
 ./clockify.py start --description "Deep work" --project <project-id> --task <task-id> --billable
 ./clockify.py update-running --adjust-minutes 5
+./clockify.py split-running --minutes-ago 5
 ./clockify.py add-manual --date today --start 09:00 --end 10:30 --description "Planning"
+./clockify.py set-config --time-step-min 10 --duration-format full --daily-target-hours 8 --weekly-target-hours 40
 ./clockify.py export-csv --start-date 2026-11-01 --end-date 2026-11-30
 ```
 
@@ -87,7 +90,7 @@ omarchy plugin validate .
 ```bash
 omarchy plugin disable io.github.abdulrahmanhr.clockify
 omarchy plugin remove io.github.abdulrahmanhr.clockify
-rm -f ~/.config/omarchy/clockify.json ~/.local/bin/clockify-ctl
+rm -f ~/.config/omarchy/clockify.json ~/.config/omarchy/clockify-cache.json ~/.local/bin/clockify-ctl
 ```
 
 ## License

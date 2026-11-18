@@ -52,6 +52,60 @@ function formatCompactDuration(seconds) {
   return (hrs >= 10 ? Math.round(hrs) : hrs.toFixed(1).replace(/\.0$/, "")) + "h"
 }
 
+function formatDurationByMode(seconds, durationFormat) {
+  var mode = String(durationFormat || "compact").toLowerCase()
+  if (mode === "full") return formatClock(seconds)
+  if (mode === "decimal") {
+    var hrs = Math.max(0, Number(seconds) || 0) / 3600
+    return hrs.toFixed(2) + "h"
+  }
+  return formatDuration(seconds)
+}
+
+function _parseHhMmTotalMinutes(value, fallbackDate) {
+  var m = /^\s*(\d{1,2}):(\d{2})/.exec(String(value || ""))
+  if (m) {
+    var h = parseInt(m[1], 10)
+    var min = parseInt(m[2], 10)
+    if (isFinite(h) && isFinite(min) && h >= 0 && h <= 23 && min >= 0 && min <= 59) {
+      return h * 60 + min
+    }
+  }
+  var ref = (fallbackDate && typeof fallbackDate.getHours === "function") ? fallbackDate : new Date()
+  return ref.getHours() * 60 + ref.getMinutes()
+}
+
+function stepTimeHhMm(value, deltaMinutes, fallbackDate) {
+  var total = _parseHhMmTotalMinutes(value, fallbackDate)
+  var delta = parseInt(deltaMinutes || 0, 10)
+  if (!isFinite(delta)) delta = 0
+  var wrapped = ((total + delta) % 1440 + 1440) % 1440
+  return pad2(Math.floor(wrapped / 60)) + ":" + pad2(wrapped % 60)
+}
+
+function roundTimeHhMm(value, stepMinutes, fallbackDate) {
+  var total = _parseHhMmTotalMinutes(value, fallbackDate)
+  var step = Math.max(1, Math.min(60, parseInt(stepMinutes || 5, 10) || 5))
+  var rounded = Math.round(total / step) * step
+  var wrapped = ((rounded % 1440) + 1440) % 1440
+  return pad2(Math.floor(wrapped / 60)) + ":" + pad2(wrapped % 60)
+}
+
+function stepDateIso(value, deltaDays, fallbackDate) {
+  var now = (fallbackDate && typeof fallbackDate.getFullYear === "function") ? fallbackDate : new Date()
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0)
+  var raw = String(value || "").trim().toLowerCase()
+  var base = today
+  if (raw === "yesterday") {
+    base = addDays(today, -1)
+  } else if (raw !== "" && raw !== "today") {
+    base = parseLocalDateIso(raw) || today
+  }
+  var delta = parseInt(deltaDays || 0, 10)
+  if (!isFinite(delta)) delta = 0
+  return toLocalDateIso(addDays(base, delta))
+}
+
 function parseStamp(value) {
   var text = String(value || "").trim()
   if (text === "") return null
@@ -608,7 +662,10 @@ function buildDashboard(entries, bounds, periodMode, weekStart, nowDate) {
 
   var groupedByDate = []
   for (var gk in dateGroupsMap) {
-    if (Object.prototype.hasOwnProperty.call(dateGroupsMap, gk)) groupedByDate.push(dateGroupsMap[gk])
+    if (!Object.prototype.hasOwnProperty.call(dateGroupsMap, gk)) continue
+    var grp = dateGroupsMap[gk]
+    grp.groupedEntries = groupSimilarDayEntries(grp.entries)
+    groupedByDate.push(grp)
   }
   groupedByDate.sort(function(a, b) { return a.dateIso < b.dateIso ? 1 : -1 })
 
@@ -751,5 +808,146 @@ function buildDashboard(entries, bounds, periodMode, weekStart, nowDate) {
     tagBreakdown: tagBreakdown,
     dayBreakdown: dayBreakdown,
     groupedByDate: groupedByDate
+  }
+}
+
+function groupSimilarDayEntries(dayEntries) {
+  var list = Array.isArray(dayEntries) ? dayEntries : []
+  var map = {}
+  var ordered = []
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i] || {}
+    var tids = Array.isArray(e.tagIds) ? e.tagIds.slice().sort().join(",") : ""
+    var key = [
+      String(e.description || "").trim(),
+      String(e.projectId || ""),
+      String(e.taskId || ""),
+      e.billable ? "1" : "0",
+      tids
+    ].join("\n")
+    if (!map[key]) {
+      var group = {
+        groupKey: key,
+        id: String(e.id || key),
+        count: 0,
+        totalSeconds: 0,
+        description: String(e.description || "").trim(),
+        projectId: String(e.projectId || ""),
+        projectName: String(e.projectName || ""),
+        projectColor: String(e.projectColor || ""),
+        clientName: String(e.clientName || ""),
+        taskId: String(e.taskId || ""),
+        taskName: String(e.taskName || ""),
+        tagIds: Array.isArray(e.tagIds) ? e.tagIds : [],
+        tagNames: Array.isArray(e.tagNames) ? e.tagNames : [],
+        billable: e.billable === true,
+        startLocal: String(e.startLocal || ""),
+        endLocal: String(e.endLocal || ""),
+        dateIso: String(e.dateIso || ""),
+        dateLabel: String(e.dateLabel || ""),
+        latestEntry: e,
+        entries: []
+      }
+      map[key] = group
+      ordered.push(group)
+    }
+    var g = map[key]
+    g.count += 1
+    g.totalSeconds += Math.max(0, Number(e.seconds || 0))
+    if (e.startLocal && (!g.startLocal || String(e.startLocal) < g.startLocal)) {
+      g.startLocal = String(e.startLocal)
+    }
+    if (e.endLocal && (!g.endLocal || String(e.endLocal) > g.endLocal)) {
+      g.endLocal = String(e.endLocal)
+    }
+    g.entries.push(e)
+  }
+  return ordered
+}
+
+function buildWeeklyTimesheet(entries, projects, weekStart, offset, nowDate) {
+  var bounds = computePeriodBounds("week", offset, weekStart, "", "", nowDate)
+  var days = []
+  var dayIndexByIso = {}
+  for (var i = 0; i < 7; i++) {
+    var d = addDays(bounds.startDate, i)
+    var dIso = toLocalDateIso(d)
+    days.push({
+      dayIndex: i,
+      dateIso: dIso,
+      shortLabel: DAYS_SHORT[d.getDay()],
+      dayNum: d.getDate() + " " + MONTHS_SHORT[d.getMonth()],
+      isToday: dIso === bounds.todayIso,
+      totalSeconds: 0
+    })
+    dayIndexByIso[dIso] = i
+  }
+
+  var rowMap = {}
+  var rows = []
+  var grandTotalSeconds = 0
+  var list = Array.isArray(entries) ? entries : []
+
+  for (var ei = 0; ei < list.length; ei++) {
+    var e = list[ei] || {}
+    var idx = dayIndexByIso[String(e.dateIso || "")]
+    if (idx === undefined) continue
+    var sec = Math.max(0, Number(e.seconds || 0))
+    var pid = String(e.projectId || "")
+    var tid = String(e.taskId || "")
+    var rKey = pid + "|" + tid + "|" + (e.billable ? "1" : "0")
+    if (!rowMap[rKey]) {
+      rowMap[rKey] = {
+        key: rKey,
+        projectId: pid,
+        projectName: String(e.projectName || "No project"),
+        projectColor: String(e.projectColor || ""),
+        clientName: String(e.clientName || ""),
+        taskId: tid,
+        taskName: String(e.taskName || ""),
+        billable: e.billable === true,
+        daySeconds: [0, 0, 0, 0, 0, 0, 0],
+        totalSeconds: 0
+      }
+      rows.push(rowMap[rKey])
+    }
+    rowMap[rKey].daySeconds[idx] += sec
+    rowMap[rKey].totalSeconds += sec
+    days[idx].totalSeconds += sec
+    grandTotalSeconds += sec
+  }
+
+  rows.sort(function(a, b) { return b.totalSeconds - a.totalSeconds })
+
+  // Include active projects with 0h this week so any day cell can be clicked to log quickly.
+  var seenProjects = {}
+  for (var ri = 0; ri < rows.length; ri++) {
+    if (rows[ri].projectId) seenProjects[rows[ri].projectId] = true
+  }
+  var projList = Array.isArray(projects) ? projects : []
+  for (var pi = 0; pi < projList.length && rows.length < 10; pi++) {
+    var p = projList[pi] || {}
+    var pid2 = String(p.id || "")
+    if (!pid2 || seenProjects[pid2]) continue
+    seenProjects[pid2] = true
+    rows.push({
+      key: pid2 + "||" + (p.billable ? "1" : "0"),
+      projectId: pid2,
+      projectName: String(p.name || "Project"),
+      projectColor: String(p.color || ""),
+      clientName: String(p.clientName || ""),
+      taskId: "",
+      taskName: "",
+      billable: p.billable === true,
+      daySeconds: [0, 0, 0, 0, 0, 0, 0],
+      totalSeconds: 0
+    })
+  }
+
+  return {
+    bounds: bounds,
+    days: days,
+    rows: rows,
+    grandTotalSeconds: grandTotalSeconds
   }
 }
