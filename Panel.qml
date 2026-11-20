@@ -373,6 +373,7 @@ Panel {
       confirmDiscard = false
       confirmDeleteId = ""
       confirmManageActionKey = ""
+      clockify.clearPendingExportOverwrite()
       historyDayLimit = 14
       if (panelFlick) panelFlick.contentY = 0
       syncDraftDefaults()
@@ -400,6 +401,7 @@ Panel {
       confirmDiscard = false
       confirmDeleteId = ""
       confirmManageActionKey = ""
+      clockify.clearPendingExportOverwrite()
     }
   }
 
@@ -1610,8 +1612,68 @@ Panel {
                   root.filterTaskId,
                   root.filterTagId,
                   root.filterBillable,
-                  root.historyQuery
+                  root.historyQuery,
+                  false
                 )
+              }
+            }
+
+            // Export overwrite confirmation banner
+            Rectangle {
+              visible: clockify.pendingExportOverwritePath !== ""
+              width: parent.width
+              implicitHeight: exportConfirmRow.implicitHeight + Style.space(12)
+              radius: Style.radius("sm")
+              color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.12)
+              border.width: 1
+              border.color: Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.45)
+
+              RowLayout {
+                id: exportConfirmRow
+                anchors.fill: parent
+                anchors.margins: Style.space(6)
+                spacing: Style.space(6)
+
+                Text {
+                  Layout.fillWidth: true
+                  textFormat: Text.PlainText
+                  text: "Replace existing " + (clockify.pendingExportOverwritePath.split("/").pop() || "report.csv") + "?"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideMiddle
+                }
+
+                Button {
+                  text: "Cancel"
+                  bordered: true
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: {
+                    clockify.clearPendingExportOverwrite()
+                    clockify.lastError = ""
+                  }
+                }
+
+                Button {
+                  text: "Replace"
+                  bordered: true
+                  foreground: root.urgent
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  enabled: !clockify.actionBusy
+                  onClicked: clockify.exportCsv(
+                    root.periodBounds.startIso,
+                    root.periodBounds.endIso,
+                    root.filterProjectId,
+                    root.filterTaskId,
+                    root.filterTagId,
+                    root.filterBillable,
+                    root.historyQuery,
+                    true
+                  )
+                }
               }
             }
 

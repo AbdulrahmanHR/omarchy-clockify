@@ -80,6 +80,7 @@ Item {
   property string lastError: ""
   property string note: ""
   property string fetchedAt: ""
+  property string pendingExportOverwritePath: ""
 
   readonly property bool timing: running !== null
   readonly property bool refreshing: statusProcess.running
@@ -156,8 +157,13 @@ Item {
     runAction(cmd, true, false, false)
   }
 
-  function exportCsv(startDateIso, endDateIso, projectId, taskId, tagId, billableMode, query) {
+  function clearPendingExportOverwrite() {
+    pendingExportOverwritePath = ""
+  }
+
+  function exportCsv(startDateIso, endDateIso, projectId, taskId, tagId, billableMode, query, overwrite) {
     if (!ready) return
+    pendingExportOverwritePath = ""
     var cmd = [
       helperPath, "export-csv",
       "--start-date", String(startDateIso || ""),
@@ -168,6 +174,7 @@ Item {
       "--billable", String(billableMode || "all"),
       "--query", String(query || "")
     ]
+    if (overwrite === true) cmd.push("--overwrite")
     runAction(cmd, true, false, false)
   }
 
@@ -589,6 +596,7 @@ Item {
     userEmail = ""
     userId = ""
     lastAutoStoppedId = ""
+    pendingExportOverwritePath = ""
   }
 
   function _identityChanged(prevConfigured, prevAuthSource, prevUserId, prevWorkspaceId,
@@ -604,11 +612,17 @@ Item {
     var payload = Model.parsePayload(raw)
 
     if (payload.ok === false) {
+      var prevAuthSource = authSource
       lastError = String(payload.error || "Clockify request failed")
       note = ""
       if (payload.configured !== undefined) configured = payload.configured === true
       if (payload.authSource !== undefined) authSource = String(payload.authSource || "")
-      if (!configured) clearAccountData()
+      if (!configured || (prevAuthSource !== "" && authSource !== "" && prevAuthSource !== authSource)) {
+        clearAccountData()
+      }
+      if (payload.exportExists === true) {
+        pendingExportOverwritePath = String(payload.exportPath || "")
+      }
       return payload
     }
 

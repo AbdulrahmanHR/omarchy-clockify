@@ -1437,7 +1437,33 @@ def cmd_export_csv(args):
         out_path = Path.home() / "Downloads" / ("clockify-report-%s_to_%s.csv" % (s_lbl, e_lbl))
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(out_path, "w", encoding="utf-8", newline="") as fh:
+    overwrite = bool(getattr(args, "overwrite", False))
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_TRUNC if overwrite else os.O_EXCL)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(out_path, flags, 0o600)
+    except FileExistsError:
+        payload = base_payload()
+        _apply_prefs_to_payload(payload, config)
+        payload.update({
+            "ok": False,
+            "configured": True,
+            "authSource": source,
+            "exportExists": True,
+            "exportPath": str(out_path),
+            "error": "Report %s already exists. Confirm replace to overwrite." % out_path.name,
+        })
+        remember_host(config, api)
+        return payload
+
+    try:
+        os.fchmod(fd, 0o600)
+    except Exception:
+        os.close(fd)
+        raise
+
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["Date", "Start", "End", "Duration", "Seconds", "Description", "Project", "Client", "Task", "Tags", "Billable"])
         for e in filtered:
@@ -2266,6 +2292,7 @@ def build_parser():
     exp.add_argument("--billable", default="all", choices=["all", "billable", "non-billable"])
     exp.add_argument("--query", default="")
     exp.add_argument("--output", default="")
+    exp.add_argument("--overwrite", action="store_true", help="overwrite an existing export file")
     exp.set_defaults(handler=cmd_export_csv)
 
     start = commands.add_parser("start", help="stop any running entry and start a new timer")

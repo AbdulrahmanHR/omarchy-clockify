@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -158,6 +159,85 @@ class ClockifyHelperTests(unittest.TestCase):
             self.assertEqual(rows[1][3], "1:30:00")
             self.assertEqual(rows[1][5], "Ship dashboard")
             self.assertEqual(rows[1][10], "Yes")
+
+    def test_export_csv_private_permissions_and_overwrite_guard(self):
+        fake_snap = {
+            "loadedStartDate": "2026-11-01",
+            "loadedEndDate": "2026-11-17",
+            "recentEntries": [
+                {
+                    "id": "e1",
+                    "dateIso": "2026-11-17",
+                    "startLocal": "09:00",
+                    "endLocal": "10:00",
+                    "seconds": 3600,
+                    "description": "Account A entry",
+                    "projectId": "p1",
+                    "projectName": "Proj",
+                    "clientName": "",
+                    "taskId": "",
+                    "taskName": "",
+                    "tagIds": [],
+                    "tagNames": [],
+                    "billable": False,
+                    "dateLabel": "Today",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_csv = Path(tmp) / "report.csv"
+            ident = clockify.Identity("u1", "w1", "Tester")
+            old_umask = os.umask(0o022)
+            try:
+                args = clockify.build_parser().parse_args([
+                    "export-csv",
+                    "--start-date", "2026-11-01",
+                    "--end-date", "2026-11-17",
+                    "--output", str(out_csv),
+                ])
+                with mock.patch.object(clockify, "load_config", return_value={}), \
+                     mock.patch.object(clockify, "open_client", return_value=(mock.MagicMock(), ident, "api-key")), \
+                     mock.patch.object(clockify, "snapshot", return_value=fake_snap), \
+                     mock.patch.object(clockify, "remember_host"):
+                    res1 = clockify.cmd_export_csv(args)
+
+                self.assertTrue(res1["ok"])
+                self.assertEqual(stat.S_IMODE(out_csv.stat().st_mode), 0o600)
+                original_content = out_csv.read_text(encoding="utf-8")
+
+                # Without --overwrite, existing report must not be replaced
+                fake_snap["recentEntries"][0]["description"] = "Account B entry"
+                with mock.patch.object(clockify, "load_config", return_value={}), \
+                     mock.patch.object(clockify, "open_client", return_value=(mock.MagicMock(), ident, "api-key")), \
+                     mock.patch.object(clockify, "snapshot", return_value=fake_snap), \
+                     mock.patch.object(clockify, "remember_host"):
+                    res2 = clockify.cmd_export_csv(args)
+
+                self.assertFalse(res2["ok"])
+                self.assertTrue(res2.get("exportExists"))
+                self.assertEqual(res2.get("exportPath"), str(out_csv))
+                self.assertEqual(out_csv.read_text(encoding="utf-8"), original_content)
+
+                # With --overwrite, report is replaced and keeps 0600 permissions
+                os.chmod(out_csv, 0o644)
+                args_overwrite = clockify.build_parser().parse_args([
+                    "export-csv",
+                    "--start-date", "2026-11-01",
+                    "--end-date", "2026-11-17",
+                    "--output", str(out_csv),
+                    "--overwrite",
+                ])
+                with mock.patch.object(clockify, "load_config", return_value={}), \
+                     mock.patch.object(clockify, "open_client", return_value=(mock.MagicMock(), ident, "api-key")), \
+                     mock.patch.object(clockify, "snapshot", return_value=fake_snap), \
+                     mock.patch.object(clockify, "remember_host"):
+                    res3 = clockify.cmd_export_csv(args_overwrite)
+
+                self.assertTrue(res3["ok"])
+                self.assertIn("Account B entry", out_csv.read_text(encoding="utf-8"))
+                self.assertEqual(stat.S_IMODE(out_csv.stat().st_mode), 0o600)
+            finally:
+                os.umask(old_umask)
 
     def test_qml_plain_text_and_model_markup_safety(self):
         qml_text = (PLUGIN_DIR / "Panel.qml").read_text(encoding="utf-8")
@@ -613,7 +693,7 @@ class AuthIsolationTests(unittest.TestCase):
           todayBillableSeconds: 0, weekBillableSeconds: 0, monthBillableSeconds: 0,
           loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
           fullLoaded: false, lastFullRefreshMs: 0, _nextIsCacheOnly: false,
-          lastError: '', note: '', lastAutoStoppedId: '',
+          lastError: '', note: '', lastAutoStoppedId: '', pendingExportOverwritePath: '',
           defaultProjectId: '', defaultTaskId: '', defaultTagIds: [], defaultBillable: false,
           weekStart: 'monday', panelWidth: 560, panelHeight: 740, wrapText: true,
           timeStepMinutes: 5, quickStepMinutes: 1, durationFormat: 'compact',
@@ -678,6 +758,29 @@ class AuthIsolationTests(unittest.TestCase):
         }}
         if (ctx.fullLoaded !== false || refreshCalls.pop() !== true) {{
           throw new Error('non-full status did not trigger full refresh after account change');
+        }}
+
+        // 3. Account A -> failed refresh when authSource changes clears prior account data
+        ctx.applyPayload(JSON.stringify(accountA));
+        ctx.applyPayload(JSON.stringify({{
+          ok: false, configured: true, authSource: 'api-key',
+          error: 'Unauthorized',
+        }}));
+        if (ctx.recentEntries.length || ctx.projects.length || ctx.tags.length || ctx.clients.length || ctx.workspaces.length || ctx.userId !== '' || ctx.workspaceName !== '') {{
+          throw new Error('failed refresh after authSource change kept prior account data');
+        }}
+        if (ctx.authSource !== 'api-key') {{
+          throw new Error('failed refresh did not update authSource');
+        }}
+
+        // 4. exportExists sets pendingExportOverwritePath
+        ctx.applyPayload(JSON.stringify({{
+          ok: false, configured: true, authSource: 'api-key',
+          exportExists: true, exportPath: '/tmp/clockify-report.csv',
+          error: 'Report already exists',
+        }}));
+        if (ctx.pendingExportOverwritePath !== '/tmp/clockify-report.csv') {{
+          throw new Error('exportExists did not set pendingExportOverwritePath');
         }}
         """
         proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
