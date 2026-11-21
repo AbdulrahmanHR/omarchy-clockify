@@ -403,6 +403,15 @@ def resolve_auth(config):
     return "", "", ""
 
 
+def _is_desktop_session_expired(config):
+    """True when the user opted into Desktop-session mode but no active access JWT is available."""
+    if not isinstance(config, dict):
+        return False
+    if str(config.get("apiKey") or os.environ.get("CLOCKIFY_API_KEY") or "").strip():
+        return False
+    return config.get("useDesktopSession") is True
+
+
 # -------------------------------------------------------------------- http
 
 class Api:
@@ -896,6 +905,7 @@ def base_payload():
     return {
         "ok": True,
         "configured": False,
+        "desktopSessionExpired": False,
         "authSource": "",
         "error": "",
         "note": "",
@@ -1307,6 +1317,7 @@ def unconfigured(config, note=""):
     payload = base_payload()
     _apply_prefs_to_payload(payload, config)
     payload["note"] = note
+    payload["desktopSessionExpired"] = _is_desktop_session_expired(config)
     return payload
 
 
@@ -2273,6 +2284,7 @@ def cmd_set_config(args):
     cred, _, source = resolve_auth(config)
     payload["configured"] = bool(cred)
     payload["authSource"] = source
+    payload["desktopSessionExpired"] = (not bool(cred)) and _is_desktop_session_expired(config)
     return payload
 
 

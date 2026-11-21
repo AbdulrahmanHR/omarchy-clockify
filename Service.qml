@@ -13,6 +13,7 @@ Item {
   property bool isPrimaryMonitor: true
 
   property bool configured: false
+  property bool desktopSessionExpired: false
   property string authSource: ""
   property string userId: ""
   property string userName: ""
@@ -136,6 +137,10 @@ Item {
   function refreshIfStale(wantFull, fullMaxAgeMs) {
     if (!ready) return
     var nowMs = Date.now()
+    if (!configured && desktopSessionExpired && (nowMs - lastRefreshMs) > 2000) {
+      refresh(true)
+      return
+    }
     if (!fullLoaded && configured) {
       refresh(true)
       return
@@ -483,6 +488,14 @@ Item {
 
   function launchDesktopApp() {
     Quickshell.execDetached(["clockify"])
+    if (!configured && desktopSessionExpired) {
+      desktopWakeRecheckTimer.attemptsLeft = 3
+      desktopWakeRecheckTimer.restart()
+    }
+  }
+
+  function openApiKeyPage() {
+    Qt.openUrlExternally("https://app.clockify.me/user/preferences#advanced")
   }
 
   function openWebApp() {
@@ -647,6 +660,7 @@ Item {
       lastError = String(payload.error || "Clockify request failed")
       note = ""
       if (payload.configured !== undefined) configured = payload.configured === true
+      if (payload.desktopSessionExpired !== undefined) desktopSessionExpired = payload.desktopSessionExpired === true
       if (payload.authSource !== undefined) authSource = String(payload.authSource || "")
       if (!configured || (prevAuthSource !== "" && authSource !== "" && prevAuthSource !== authSource)) {
         clearAccountData()
@@ -685,6 +699,7 @@ Item {
     lastError = String(payload.error || "")
     note = String(payload.note || "")
     configured = nextConfigured
+    desktopSessionExpired = (!nextConfigured && payload.desktopSessionExpired === true)
     authSource = nextAuthSource
     userId = nextUserId
     userName = String(payload.userName || "")
@@ -788,6 +803,33 @@ Item {
     repeat: true
     running: root.ready && root.configured
     onTriggered: root.refresh(false)
+  }
+
+  // Desktop-session mode only: the Desktop app refreshes its 60-minute token when its
+  // window is focused. Re-scan its storage locally (no network while expired) so the
+  // widget reconnects by itself as soon as a fresh token appears.
+  Timer {
+    id: desktopReconnectTimer
+    interval: 20000
+    repeat: true
+    running: root.ready && !root.configured && root.desktopSessionExpired
+    onTriggered: root.refresh(true)
+  }
+
+  Timer {
+    id: desktopWakeRecheckTimer
+    property int attemptsLeft: 0
+    interval: 2500
+    repeat: true
+    onTriggered: {
+      if (root.configured || attemptsLeft <= 0) {
+        stop()
+        return
+      }
+      attemptsLeft -= 1
+      root.refresh(true)
+      if (attemptsLeft <= 0) stop()
+    }
   }
 
   Timer {

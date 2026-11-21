@@ -184,6 +184,7 @@ Panel {
 
   readonly property bool anyPopupOrInputFocused: (
     keyField.activeFocus ||
+    settingsKeyField.activeFocus ||
     descriptionField.activeFocus ||
     manualDateField.inputFocused ||
     manualStartField.inputFocused ||
@@ -371,6 +372,14 @@ Panel {
     clockify.saveKey(key)
   }
 
+  function commitSettingsKey() {
+    var key = settingsKeyField.text
+    if (String(key).trim() === "") return
+    settingsKeyField.text = ""
+    settingsKeyField.focus = false
+    clockify.saveKey(key)
+  }
+
   function submitManualEntry() {
     clockify.addManual(
       draftDescription,
@@ -467,6 +476,14 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
+    function setTab(tab: string): string {
+      var next = String(tab || "").trim()
+      if (next !== "tracker" && next !== "history" && next !== "manage" && next !== "settings") {
+        return "invalid tab"
+      }
+      root.activeTab = next
+      return "ok"
+    }
     function refresh(): string { clockify.refresh(true); return "ok" }
     function startTimer(description: string, projectId: string): string {
       clockify.start(description, projectId, "", clockify.defaultTagIds, clockify.defaultBillable)
@@ -476,7 +493,7 @@ Panel {
     function toggleTimer(): string { root.toggleTimer(); return "ok" }
     function discardTimer(): string { clockify.discard(); return "ok" }
     function status(): string {
-      if (!clockify.configured) return "not configured"
+      if (!clockify.configured) return clockify.desktopSessionExpired ? "desktop session expired" : "not configured"
       if (!clockify.timing) return "idle, today " + Model.formatDuration(root.todaySeconds)
       return Model.describeEntry(clockify.running) + " " + Model.formatClock(root.elapsedSeconds)
     }
@@ -485,6 +502,7 @@ Panel {
       return JSON.stringify({
         screen: window && window.screen ? String(window.screen.name) : "unknown",
         configured: clockify.configured,
+        desktopSessionExpired: clockify.desktopSessionExpired,
         authSource: clockify.authSource,
         timing: clockify.timing,
         running: clockify.running,
@@ -575,7 +593,7 @@ Panel {
                   Model.taskLabel(clockify.running),
                   clockify.running.billable ? "Billable" : ""
                 ].filter(function(x) { return x !== "" }).join("  ·  ")
-              : (clockify.configured ? "Today " + Model.formatDurationByMode(root.todaySeconds, clockify.durationFormat) + "  ·  Week " + Model.formatDurationByMode(root.weekSeconds, clockify.durationFormat) : "Not connected")
+              : (clockify.configured ? "Today " + Model.formatDurationByMode(root.todaySeconds, clockify.durationFormat) + "  ·  Week " + Model.formatDurationByMode(root.weekSeconds, clockify.durationFormat) : (clockify.desktopSessionExpired ? "Desktop session expired  ·  Open Clockify or add API key" : "Not connected"))
             detail: clockify.pomodoroRunning
               ? (clockify.pomodoroPhase === "work" ? "Focus " : "Break ") + Model.formatClock(clockify.pomodoroSecondsLeft)
               : (clockify.timing ? "Today " + Model.formatDurationByMode(root.todaySeconds, clockify.durationFormat) : "")
@@ -924,7 +942,7 @@ Panel {
             spacing: Style.space(8)
 
             PanelSectionHeader {
-              text: "CONNECT CLOCKIFY"
+              text: clockify.desktopSessionExpired ? "DESKTOP SESSION EXPIRED" : "CONNECT CLOCKIFY"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -932,7 +950,9 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Paste a personal API key (Clockify → Preferences → Advanced → API), or explicitly opt in to use your active Clockify Desktop session in read-only mode (tokens are never refreshed or copied to disk)."
+              text: clockify.desktopSessionExpired
+                ? "Clockify Desktop's 60-minute access token expired while it ran in the background (it only refreshes when its window is opened). Paste a Personal API Key below for always-on background sync and full edit access, or open Clockify Desktop to refresh read-only mode."
+                : "Recommended: paste a Personal API Key (Clockify → Preferences → Advanced → API) for always-on background sync (no need to open Clockify Desktop) and full start/stop/edit control. The Clockify Desktop session is read-only and expires after 60 min in the background."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -960,7 +980,7 @@ Panel {
                 iconText: "󰌆"
                 bordered: true
                 enabled: !clockify.actionBusy && keyField.text !== ""
-                foreground: root.foreground
+                foreground: root.accent
                 fontFamily: root.fontFamily
                 onClicked: root.commitKey()
               }
@@ -971,22 +991,53 @@ Panel {
               spacing: Style.space(8)
 
               Button {
-                text: "Use Clockify Desktop Session"
+                visible: !clockify.desktopSessionExpired
+                text: "Desktop Session (Read-Only)"
                 iconText: "󰌆"
                 bordered: true
                 enabled: !clockify.actionBusy
-                foreground: root.accent
+                foreground: root.foreground
                 fontFamily: root.fontFamily
                 onClicked: clockify.connectDesktop()
+              }
+
+              Button {
+                text: "Get API Key"
+                iconText: "󰖟"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: clockify.openApiKeyPage()
               }
 
               Button {
                 text: "Open Clockify App"
                 iconText: "󰀻"
                 bordered: true
-                foreground: root.foreground
+                foreground: clockify.desktopSessionExpired ? root.accent : root.foreground
                 fontFamily: root.fontFamily
                 onClicked: clockify.launchDesktopApp()
+              }
+
+              Button {
+                visible: clockify.desktopSessionExpired
+                text: "Retry"
+                iconText: "󰑐"
+                bordered: true
+                enabled: !clockify.actionBusy && !clockify.refreshing
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: clockify.refresh(true)
+              }
+
+              Button {
+                visible: clockify.desktopSessionExpired
+                text: "Disconnect"
+                iconText: "󰌆"
+                bordered: true
+                foreground: root.urgent
+                fontFamily: root.fontFamily
+                onClicked: clockify.clearKey()
               }
             }
           }
@@ -3500,10 +3551,48 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "Auth source: " + (clockify.authSource === "desktop-app" ? "Clockify Desktop session (read-only)" : clockify.authSource)
+              text: "Auth source: " + (clockify.authSource === "desktop-app" ? "Clockify Desktop session (read-only, expires after 60m in background)" : (clockify.authSource === "api-key" ? "Personal API Key (always-on, full access)" : clockify.authSource))
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+              visible: clockify.configured && clockify.authSource === "desktop-app"
+              width: parent.width
+              spacing: Style.space(8)
+
+              TextField {
+                id: settingsKeyField
+                Layout.fillWidth: true
+                password: true
+                placeholderText: "Switch to Personal API Key (always-on + full edit)"
+                foreground: root.foreground
+                font.family: root.fontFamily
+                enabled: !clockify.actionBusy
+                onAccepted: root.commitSettingsKey()
+                Keys.onEscapePressed: focus = false
+              }
+
+              Button {
+                text: "Get Key"
+                iconText: "󰖟"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: clockify.openApiKeyPage()
+              }
+
+              Button {
+                text: "Use API Key"
+                iconText: "󰌆"
+                bordered: true
+                enabled: !clockify.actionBusy && settingsKeyField.text !== ""
+                foreground: root.accent
+                fontFamily: root.fontFamily
+                onClicked: root.commitSettingsKey()
+              }
             }
 
             RowLayout {

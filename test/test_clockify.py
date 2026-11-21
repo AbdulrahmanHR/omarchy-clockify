@@ -494,6 +494,46 @@ class AuthIsolationTests(unittest.TestCase):
                 self.assertEqual(hdr, "X-Auth-Token")
                 self.assertEqual(src, "desktop-app")
 
+    def test_desktop_session_expired_flag_when_access_jwt_expired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            ldb_dir = xdg / "Clockify" / "Local Storage" / "leveldb"
+            ldb_dir.mkdir(parents=True)
+            expired_access = self._make_jwt("access", exp_offset=-60)
+            refresh_jwt = self._make_jwt("refresh", exp_offset=86400)
+            (ldb_dir / "000001.log").write_text(
+                f'token="{expired_access}" refreshToken="{refresh_jwt}"', encoding="utf-8"
+            )
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False), \
+                 mock.patch.object(clockify, "Api") as mock_api:
+                # Not opted in: never flagged as an expired Desktop session.
+                cfg_file.write_text(json.dumps({}), encoding="utf-8")
+                res = clockify.cmd_status(clockify.build_parser().parse_args(["status"]))
+                self.assertFalse(res["configured"])
+                self.assertFalse(res["desktopSessionExpired"])
+
+                # Opted in with only an expired access token: flagged, refresh token never used.
+                cfg_file.write_text(json.dumps({"useDesktopSession": True}), encoding="utf-8")
+                for argv in (["status"], ["status", "--from-cache"]):
+                    res = clockify.cmd_status(clockify.build_parser().parse_args(argv))
+                    self.assertTrue(res["ok"])
+                    self.assertFalse(res["configured"])
+                    self.assertTrue(res["desktopSessionExpired"])
+                    self.assertEqual(res["authSource"], "")
+                mock_api.assert_not_called()
+                self.assertEqual(clockify.resolve_auth(clockify.load_config()), ("", "", ""))
+
+                # Disconnect clears the opt-in, so the flag drops again.
+                res = clockify.cmd_clear_key(clockify.build_parser().parse_args(["clear-key"]))
+                self.assertFalse(res["desktopSessionExpired"])
+
+                # A personal API key always wins over an expired Desktop session.
+                cfg_file.write_text(json.dumps({"useDesktopSession": True, "apiKey": "k"}), encoding="utf-8")
+                self.assertFalse(clockify._is_desktop_session_expired(clockify.load_config()))
+
     def test_connect_desktop_opts_in_without_storing_tokens(self):
         with tempfile.TemporaryDirectory() as tmp:
             xdg = Path(tmp)
@@ -690,7 +730,7 @@ class AuthIsolationTests(unittest.TestCase):
           Qt: {{ callLater(fn) {{ fn(); }} }},
           helperPath: '/tmp/clockify.py',
           ready: true,
-          configured: false, authSource: '', userId: '', userName: '', userEmail: '',
+          configured: false, desktopSessionExpired: false, authSource: '', userId: '', userName: '', userEmail: '',
           workspaceId: '', workspaceName: '', workspaces: [], projects: [], tags: [], clients: [],
           running: null, recentEntries: [], todaySeconds: 0, weekSeconds: 0, monthSeconds: 0,
           todayBillableSeconds: 0, weekBillableSeconds: 0, monthBillableSeconds: 0,
@@ -780,6 +820,22 @@ class AuthIsolationTests(unittest.TestCase):
         if (ctx.authSource !== 'api-key') {{
           throw new Error('failed refresh did not update authSource');
         }}
+
+        // 3b. Desktop session expiry clears prior account data and raises the expired flag until a live snapshot arrives
+        ctx.applyPayload(JSON.stringify(accountA));
+        ctx.applyPayload(JSON.stringify({{ ok: true, configured: false, desktopSessionExpired: true, authSource: '' }}));
+        if (ctx.configured !== false || ctx.desktopSessionExpired !== true) {{
+          throw new Error('expired payload did not raise desktopSessionExpired');
+        }}
+        if (ctx.recentEntries.length || ctx.projects.length || ctx.userId !== '' || ctx.workspaceName !== '') {{
+          throw new Error('expired payload kept prior account data');
+        }}
+        ctx.applyPayload(JSON.stringify(accountA));
+        if (ctx.configured !== true || ctx.desktopSessionExpired !== false) {{
+          throw new Error('active snapshot did not clear desktopSessionExpired');
+        }}
+        // restore the api-key failure state the export checks below build on
+        ctx.applyPayload(JSON.stringify({{ ok: false, configured: true, authSource: 'api-key', error: 'Unauthorized' }}));
 
         // 4. exportExists sets pendingExportOverwritePath and confirmPendingExportOverwrite replays original params
         ctx.exportCsv('2026-11-01', '2026-11-07', 'p-1', 't-1', 'tag-1', 'billable', 'design', false);
