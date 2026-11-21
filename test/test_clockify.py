@@ -803,7 +803,40 @@ class AuthIsolationTests(unittest.TestCase):
           throw new Error('confirmPendingExportOverwrite did not replay original export params: ' + JSON.stringify(confirmedCmd));
         }}
 
-        // 5. clearPendingExportOverwrite clears snapshot so confirmPendingExportOverwrite is a no-op
+        // 5. All Loaded History (empty dates) binds Replace to the exact exportPath and effective range
+        ctx.exportCsv('', '', 'p-2', '', '', 'all', '', false);
+        ctx.applyPayload(JSON.stringify({{
+          ok: false, configured: true, authSource: 'api-key',
+          exportExists: true,
+          exportPath: '/tmp/clockify-report-2025-11-21_to_2026-11-21.csv',
+          exportStartDate: '2025-11-21',
+          exportEndDate: '2026-11-21',
+          error: 'Report already exists',
+        }}));
+        // Simulate a rolling history refresh changing loadedStartDate/loadedEndDate while prompt is open
+        ctx.applyPayload(JSON.stringify({{
+          ok: true, configured: true, authSource: 'api-key',
+          userId: 'user-a', userName: 'Alice', userEmail: 'a@example.com',
+          workspaceId: 'ws-a', fullLoaded: true,
+          loadedStartDate: '2025-11-22', loadedEndDate: '2026-11-22',
+          recentEntries: [], workspaces: [], projects: [], tags: [], clients: [],
+        }}));
+        ctx.confirmPendingExportOverwrite();
+        if (actionCalls.length !== 4) {{
+          throw new Error('confirmPendingExportOverwrite did not run for All Loaded History');
+        }}
+        const allHistCmd = actionCalls[3];
+        if (
+          !allHistCmd.includes('--overwrite') ||
+          !allHistCmd.includes('2025-11-21') ||
+          !allHistCmd.includes('2026-11-21') ||
+          !allHistCmd.includes('--output') ||
+          !allHistCmd.includes('/tmp/clockify-report-2025-11-21_to_2026-11-21.csv')
+        ) {{
+          throw new Error('confirmPendingExportOverwrite did not bind to exact path and effective range: ' + JSON.stringify(allHistCmd));
+        }}
+
+        // 6. clearPendingExportOverwrite clears snapshot so confirmPendingExportOverwrite is a no-op
         ctx.exportCsv('2026-11-08', '2026-11-14', '', '', '', 'all', '', false);
         ctx.applyPayload(JSON.stringify({{
           ok: false, configured: true, authSource: 'api-key',
@@ -812,7 +845,7 @@ class AuthIsolationTests(unittest.TestCase):
         }}));
         ctx.clearPendingExportOverwrite();
         ctx.confirmPendingExportOverwrite();
-        if (actionCalls.length !== 3) {{
+        if (actionCalls.length !== 5) {{
           throw new Error('confirmPendingExportOverwrite ran after clearPendingExportOverwrite');
         }}
         """

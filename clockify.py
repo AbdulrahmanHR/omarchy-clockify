@@ -1428,8 +1428,10 @@ def cmd_export_csv(args):
                 continue
         filtered.append(e)
 
-    s_lbl = re.sub(r"[^A-Za-z0-9._-]", "_", str(start_date or snap.get("loadedStartDate") or "start"))
-    e_lbl = re.sub(r"[^A-Za-z0-9._-]", "_", str(end_date or snap.get("loadedEndDate") or "today"))
+    eff_start = start_date or str(snap.get("loadedStartDate") or "")
+    eff_end = end_date or str(snap.get("loadedEndDate") or "")
+    s_lbl = re.sub(r"[^A-Za-z0-9._-]", "_", eff_start or "start")
+    e_lbl = re.sub(r"[^A-Za-z0-9._-]", "_", eff_end or "today")
     out_raw = str(getattr(args, "output", "") or "").strip()
     if out_raw:
         out_path = Path(out_raw).expanduser()
@@ -1452,6 +1454,8 @@ def cmd_export_csv(args):
             "authSource": source,
             "exportExists": True,
             "exportPath": str(out_path),
+            "exportStartDate": eff_start,
+            "exportEndDate": eff_end,
             "error": "Report %s already exists. Confirm replace to overwrite." % out_path.name,
         })
         remember_host(config, api)

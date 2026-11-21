@@ -163,7 +163,7 @@ Item {
     pendingExportRequest = null
   }
 
-  function exportCsv(startDateIso, endDateIso, projectId, taskId, tagId, billableMode, query, overwrite) {
+  function exportCsv(startDateIso, endDateIso, projectId, taskId, tagId, billableMode, query, overwrite, outputPath) {
     if (!ready) return
     var req = {
       startDateIso: String(startDateIso || ""),
@@ -172,7 +172,8 @@ Item {
       taskId: String(taskId || ""),
       tagId: String(tagId || ""),
       billableMode: String(billableMode || "all"),
-      query: String(query || "")
+      query: String(query || ""),
+      outputPath: String(outputPath || "")
     }
     pendingExportOverwritePath = ""
     pendingExportRequest = overwrite === true ? null : req
@@ -186,6 +187,7 @@ Item {
       "--billable", req.billableMode,
       "--query", req.query
     ]
+    if (req.outputPath !== "") cmd.push("--output", req.outputPath)
     if (overwrite === true) cmd.push("--overwrite")
     runAction(cmd, true, false, false)
   }
@@ -201,7 +203,8 @@ Item {
       req.tagId,
       req.billableMode,
       req.query,
-      true
+      true,
+      req.outputPath || pendingExportOverwritePath
     )
   }
 
@@ -650,6 +653,15 @@ Item {
       }
       if (payload.exportExists === true) {
         pendingExportOverwritePath = String(payload.exportPath || "")
+        if (pendingExportRequest) {
+          if (payload.exportStartDate !== undefined && String(payload.exportStartDate || "") !== "") {
+            pendingExportRequest.startDateIso = String(payload.exportStartDate)
+          }
+          if (payload.exportEndDate !== undefined && String(payload.exportEndDate || "") !== "") {
+            pendingExportRequest.endDateIso = String(payload.exportEndDate)
+          }
+          pendingExportRequest.outputPath = pendingExportOverwritePath
+        }
       } else {
         pendingExportRequest = null
       }
