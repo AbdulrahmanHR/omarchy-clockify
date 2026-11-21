@@ -129,6 +129,27 @@ Panel {
 
   // History filter & inline entry editor state
   property string historyQuery: ""
+
+  function invalidatePendingExportOverwrite() {
+    if (typeof clockify === "undefined" || !clockify) return
+    if (clockify.pendingExportOverwritePath !== "" || clockify.pendingExportRequest !== null) {
+      clockify.clearPendingExportOverwrite()
+      if (clockify.lastError.indexOf("already exists. Confirm replace to overwrite.") !== -1) {
+        clockify.lastError = ""
+      }
+    }
+  }
+
+  onPeriodModeChanged: invalidatePendingExportOverwrite()
+  onPeriodOffsetChanged: invalidatePendingExportOverwrite()
+  onCustomFromChanged: invalidatePendingExportOverwrite()
+  onCustomToChanged: invalidatePendingExportOverwrite()
+  onPeriodBoundsChanged: invalidatePendingExportOverwrite()
+  onFilterProjectIdChanged: invalidatePendingExportOverwrite()
+  onFilterTaskIdChanged: invalidatePendingExportOverwrite()
+  onFilterTagIdChanged: invalidatePendingExportOverwrite()
+  onFilterBillableChanged: invalidatePendingExportOverwrite()
+  onHistoryQueryChanged: invalidatePendingExportOverwrite()
   property string editingEntryId: ""
   property string entryEditDesc: ""
   property string entryEditProjectId: ""
@@ -1663,16 +1684,7 @@ Panel {
                   fontFamily: root.fontFamily
                   fontSize: Style.font.caption
                   enabled: !clockify.actionBusy
-                  onClicked: clockify.exportCsv(
-                    root.periodBounds.startIso,
-                    root.periodBounds.endIso,
-                    root.filterProjectId,
-                    root.filterTaskId,
-                    root.filterTagId,
-                    root.filterBillable,
-                    root.historyQuery,
-                    true
-                  )
+                  onClicked: clockify.confirmPendingExportOverwrite()
                 }
               }
             }

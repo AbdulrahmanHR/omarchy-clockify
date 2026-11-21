@@ -81,6 +81,7 @@ Item {
   property string note: ""
   property string fetchedAt: ""
   property string pendingExportOverwritePath: ""
+  property var pendingExportRequest: null
 
   readonly property bool timing: running !== null
   readonly property bool refreshing: statusProcess.running
@@ -159,23 +160,49 @@ Item {
 
   function clearPendingExportOverwrite() {
     pendingExportOverwritePath = ""
+    pendingExportRequest = null
   }
 
   function exportCsv(startDateIso, endDateIso, projectId, taskId, tagId, billableMode, query, overwrite) {
     if (!ready) return
+    var req = {
+      startDateIso: String(startDateIso || ""),
+      endDateIso: String(endDateIso || ""),
+      projectId: String(projectId || ""),
+      taskId: String(taskId || ""),
+      tagId: String(tagId || ""),
+      billableMode: String(billableMode || "all"),
+      query: String(query || "")
+    }
     pendingExportOverwritePath = ""
+    pendingExportRequest = overwrite === true ? null : req
     var cmd = [
       helperPath, "export-csv",
-      "--start-date", String(startDateIso || ""),
-      "--end-date", String(endDateIso || ""),
-      "--project", String(projectId || ""),
-      "--task", String(taskId || ""),
-      "--tag", String(tagId || ""),
-      "--billable", String(billableMode || "all"),
-      "--query", String(query || "")
+      "--start-date", req.startDateIso,
+      "--end-date", req.endDateIso,
+      "--project", req.projectId,
+      "--task", req.taskId,
+      "--tag", req.tagId,
+      "--billable", req.billableMode,
+      "--query", req.query
     ]
     if (overwrite === true) cmd.push("--overwrite")
     runAction(cmd, true, false, false)
+  }
+
+  function confirmPendingExportOverwrite() {
+    if (!ready || pendingExportOverwritePath === "" || !pendingExportRequest) return
+    var req = pendingExportRequest
+    exportCsv(
+      req.startDateIso,
+      req.endDateIso,
+      req.projectId,
+      req.taskId,
+      req.tagId,
+      req.billableMode,
+      req.query,
+      true
+    )
   }
 
   function start(description, projectId, taskId, tagIds, billable) {
@@ -597,6 +624,7 @@ Item {
     userId = ""
     lastAutoStoppedId = ""
     pendingExportOverwritePath = ""
+    pendingExportRequest = null
   }
 
   function _identityChanged(prevConfigured, prevAuthSource, prevUserId, prevWorkspaceId,
@@ -622,6 +650,8 @@ Item {
       }
       if (payload.exportExists === true) {
         pendingExportOverwritePath = String(payload.exportPath || "")
+      } else {
+        pendingExportRequest = null
       }
       return payload
     }

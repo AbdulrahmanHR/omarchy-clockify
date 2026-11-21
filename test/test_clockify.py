@@ -683,10 +683,13 @@ class AuthIsolationTests(unittest.TestCase):
         vm.runInContext(fs.readFileSync({json.dumps(str(model_path))}, 'utf8'), Model);
 
         const refreshCalls = [];
+        const actionCalls = [];
         const ctx = {{
           Model,
           noteTimer: {{ restart() {{}} }},
           Qt: {{ callLater(fn) {{ fn(); }} }},
+          helperPath: '/tmp/clockify.py',
+          ready: true,
           configured: false, authSource: '', userId: '', userName: '', userEmail: '',
           workspaceId: '', workspaceName: '', workspaces: [], projects: [], tags: [], clients: [],
           running: null, recentEntries: [], todaySeconds: 0, weekSeconds: 0, monthSeconds: 0,
@@ -694,6 +697,7 @@ class AuthIsolationTests(unittest.TestCase):
           loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
           fullLoaded: false, lastFullRefreshMs: 0, _nextIsCacheOnly: false,
           lastError: '', note: '', lastAutoStoppedId: '', pendingExportOverwritePath: '',
+          pendingExportRequest: null,
           defaultProjectId: '', defaultTaskId: '', defaultTagIds: [], defaultBillable: false,
           weekStart: 'monday', panelWidth: 560, panelHeight: 740, wrapText: true,
           timeStepMinutes: 5, quickStepMinutes: 1, durationFormat: 'compact',
@@ -701,6 +705,7 @@ class AuthIsolationTests(unittest.TestCase):
           pomodoroWorkMin: 25, pomodoroBreakMin: 5, dailyTargetHours: 8, weeklyTargetHours: 40,
           stopOnIdle: false, idleStopMin: 240, remindWhenIdle: false, idleRemindMin: 30,
           refresh(full) {{ refreshCalls.push(Boolean(full)); }},
+          runAction(cmd) {{ actionCalls.push(cmd); }},
         }};
         ctx.root = ctx;
         vm.createContext(ctx);
@@ -710,6 +715,9 @@ class AuthIsolationTests(unittest.TestCase):
             extractFn('clearAccountData'),
             extractFn('_identityChanged'),
             extractFn('applyPayload'),
+            extractFn('clearPendingExportOverwrite'),
+            extractFn('exportCsv'),
+            extractFn('confirmPendingExportOverwrite'),
           ].join('\\n'),
           ctx
         );
@@ -773,18 +781,58 @@ class AuthIsolationTests(unittest.TestCase):
           throw new Error('failed refresh did not update authSource');
         }}
 
-        // 4. exportExists sets pendingExportOverwritePath
+        // 4. exportExists sets pendingExportOverwritePath and confirmPendingExportOverwrite replays original params
+        ctx.exportCsv('2026-11-01', '2026-11-07', 'p-1', 't-1', 'tag-1', 'billable', 'design', false);
+        if (actionCalls.length !== 1) {{
+          throw new Error('exportCsv did not invoke runAction');
+        }}
         ctx.applyPayload(JSON.stringify({{
           ok: false, configured: true, authSource: 'api-key',
-          exportExists: true, exportPath: '/tmp/clockify-report.csv',
+          exportExists: true, exportPath: '/tmp/clockify-report-2026-11-01_to_2026-11-07.csv',
           error: 'Report already exists',
         }}));
-        if (ctx.pendingExportOverwritePath !== '/tmp/clockify-report.csv') {{
+        if (ctx.pendingExportOverwritePath !== '/tmp/clockify-report-2026-11-01_to_2026-11-07.csv') {{
           throw new Error('exportExists did not set pendingExportOverwritePath');
+        }}
+        ctx.confirmPendingExportOverwrite();
+        if (actionCalls.length !== 2) {{
+          throw new Error('confirmPendingExportOverwrite did not invoke runAction');
+        }}
+        const confirmedCmd = actionCalls[1];
+        if (!confirmedCmd.includes('--overwrite') || !confirmedCmd.includes('2026-11-01') || !confirmedCmd.includes('2026-11-07') || !confirmedCmd.includes('p-1') || !confirmedCmd.includes('design')) {{
+          throw new Error('confirmPendingExportOverwrite did not replay original export params: ' + JSON.stringify(confirmedCmd));
+        }}
+
+        // 5. clearPendingExportOverwrite clears snapshot so confirmPendingExportOverwrite is a no-op
+        ctx.exportCsv('2026-11-08', '2026-11-14', '', '', '', 'all', '', false);
+        ctx.applyPayload(JSON.stringify({{
+          ok: false, configured: true, authSource: 'api-key',
+          exportExists: true, exportPath: '/tmp/clockify-report-2026-11-08_to_2026-11-14.csv',
+          error: 'Report already exists',
+        }}));
+        ctx.clearPendingExportOverwrite();
+        ctx.confirmPendingExportOverwrite();
+        if (actionCalls.length !== 3) {{
+          throw new Error('confirmPendingExportOverwrite ran after clearPendingExportOverwrite');
         }}
         """
         proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+
+        panel_src = (PLUGIN_DIR / "Panel.qml").read_text(encoding="utf-8")
+        self.assertIn("onClicked: clockify.confirmPendingExportOverwrite()", panel_src)
+        for handler in (
+            "onPeriodModeChanged: invalidatePendingExportOverwrite()",
+            "onPeriodOffsetChanged: invalidatePendingExportOverwrite()",
+            "onCustomFromChanged: invalidatePendingExportOverwrite()",
+            "onCustomToChanged: invalidatePendingExportOverwrite()",
+            "onFilterProjectIdChanged: invalidatePendingExportOverwrite()",
+            "onFilterTaskIdChanged: invalidatePendingExportOverwrite()",
+            "onFilterTagIdChanged: invalidatePendingExportOverwrite()",
+            "onFilterBillableChanged: invalidatePendingExportOverwrite()",
+            "onHistoryQueryChanged: invalidatePendingExportOverwrite()",
+        ):
+            self.assertIn(handler, panel_src)
 
 
 if __name__ == "__main__":
