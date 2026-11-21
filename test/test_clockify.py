@@ -239,6 +239,22 @@ class ClockifyHelperTests(unittest.TestCase):
             finally:
                 os.umask(old_umask)
 
+    def test_manifest_meets_marketplace_field_limits(self):
+        manifest = json.loads((PLUGIN_DIR / "manifest.json").read_text(encoding="utf-8"))
+        limits = {
+            "id": 128,
+            "name": 120,
+            "version": 64,
+            "author": 120,
+            "description": 500,
+            "license": 120,
+        }
+        for key, max_len in limits.items():
+            if key in manifest:
+                val = str(manifest[key]).strip()
+                self.assertTrue(val, f"{key} must not be empty")
+                self.assertLessEqual(len(val), max_len, f"{key} exceeds {max_len} chars ({len(val)})")
+
     def test_qml_plain_text_and_model_markup_safety(self):
         qml_text = (PLUGIN_DIR / "Panel.qml").read_text(encoding="utf-8")
         text_blocks = list(re.finditer(r"\bText\s*\{", qml_text))

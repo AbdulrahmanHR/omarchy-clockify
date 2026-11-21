@@ -5,7 +5,7 @@
   "version": "1.2.4",
   "author": "Abdulrahman Rahmouni",
   "license": "MIT",
-  "description": "Clockify time tracker, weekly timesheet, analytics dashboard, and workspace controller in the Omarchy bar: start, stop, split, edit, round, and step timer/manual hours with configurable arrow increments, browse daily/weekly/monthly/yearly charts and grouped history, manage/archive/delete projects, tasks, tags, and clients, track daily/weekly hour targets, and run synced Pomodoro or idle reminders. A Clockify Personal API Key is recommended for always-on background sync and full editing; the optional Clockify Desktop session is read-only.",
+  "description": "Clockify time tracker, weekly timesheet, analytics dashboard, and workspace controller for the Omarchy bar: start, stop, split, edit, round, and step timers/manual hours, browse daily/weekly/monthly/yearly charts and grouped history, manage projects/tasks/tags/clients, track hour targets, and run Pomodoro or idle reminders. Personal API Key recommended for always-on background sync and full editing (Desktop session opt-in is read-only).",
   "homepage": "https://github.com/AbdulrahmanHR/omarchy-clockify",
   "kinds": [
     "bar-widget"
