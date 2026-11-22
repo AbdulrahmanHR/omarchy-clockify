@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.abdulrahmanhr.clockify",
   "name": "Clockify",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "author": "Abdulrahman Rahmouni",
   "license": "MIT",
   "description": "Clockify time tracker, weekly timesheet, analytics dashboard, and workspace controller for the Omarchy bar: start, stop, split, edit, round, and step timers/manual hours, browse daily/weekly/monthly/yearly charts and grouped history, manage projects/tasks/tags/clients, track hour targets, and run Pomodoro or idle reminders. Personal API Key recommended for always-on background sync and full editing (Desktop session opt-in is read-only).",

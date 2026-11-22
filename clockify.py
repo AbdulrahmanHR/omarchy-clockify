@@ -193,7 +193,7 @@ def _credential_fingerprint(cred, auth_source):
     if not raw or not source:
         return ""
     if source == "desktop-app":
-        claims = _decode_jwt_claims(raw)
+        claims = _decode_jwt_claims(raw) or {}
         uid = str(claims.get("user") or claims.get("sub") or claims.get("userId") or claims.get("email") or "").strip()
         material = ("desktop-app:user:%s" % uid) if uid else ("desktop-app:tok:%s" % raw)
     else:
@@ -240,6 +240,23 @@ def save_cache(payload, expected_auth_sig=None, auth_fingerprint=""):
         existing = load_cache(ws_id, user_id=user_id, auth_fingerprint=fp)
         now_iso = utc_stamp(now_utc())
         is_full = bool(payload.get("fullLoaded"))
+        clean_entries = [
+            e for e in (payload.get("recentEntries") or [])
+            if isinstance(e, dict)
+            and not str(e.get("id") or "").startswith("local:")
+            and not e.get("pendingSync")
+        ][:MAX_RECENT_ENTRIES]
+        raw_run = payload.get("running")
+        clean_running = (
+            dict(raw_run)
+            if (
+                isinstance(raw_run, dict)
+                and raw_run.get("id")
+                and not str(raw_run.get("id") or "").startswith("local:")
+                and not raw_run.get("pendingSync")
+            )
+            else None
+        )
         safe_cache = {
             "version": CACHE_VERSION,
             "authFingerprint": fp,
@@ -252,7 +269,8 @@ def save_cache(payload, expected_auth_sig=None, auth_fingerprint=""):
             "projects": payload.get("projects") if is_full else (existing.get("projects") or []),
             "tags": payload.get("tags") if is_full else (existing.get("tags") or []),
             "clients": payload.get("clients") if is_full else (existing.get("clients") or []),
-            "recentEntries": list(payload.get("recentEntries") or [])[:MAX_RECENT_ENTRIES],
+            "running": clean_running,
+            "recentEntries": clean_entries,
             "loadedStartDate": str(payload.get("loadedStartDate") or existing.get("loadedStartDate") or ""),
             "loadedEndDate": str(payload.get("loadedEndDate") or existing.get("loadedEndDate") or ""),
             "updatedAt": now_iso,
@@ -1124,6 +1142,7 @@ def base_payload():
         "remindWhenIdle": False,
         "idleRemindMin": 30,
         "refreshRequestsPerHour": 10,
+        "refreshRequestsPerHourConfigured": False,
         "hourlyRequestLimit": DEFAULT_HOURLY_LIMIT,
         "showQuotaInFooter": True,
         "quotaLimit": DEFAULT_HOURLY_LIMIT,
@@ -1183,6 +1202,7 @@ def _apply_prefs_to_payload(payload, config):
         "remindWhenIdle": _bool_pref(config, "remindWhenIdle", False),
         "idleRemindMin": _int_pref(config, "idleRemindMin", 30, 5, 480),
         "refreshRequestsPerHour": _int_pref(config, "refreshRequestsPerHour", 10, 0, 60),
+        "refreshRequestsPerHourConfigured": ("refreshRequestsPerHour" in config),
         "hourlyRequestLimit": _int_pref(config, "hourlyRequestLimit", DEFAULT_HOURLY_LIMIT, 0, 5000),
         "showQuotaInFooter": _bool_pref(config, "showQuotaInFooter", True),
     })
@@ -1431,6 +1451,36 @@ def _compact_and_append_op(ops, new_op):
     out = [dict(o) for o in (ops or [])]
     kind = str(new_op.get("kind") or "")
 
+    if kind == "start":
+        idx = _find_active_local_start_idx(out)
+        if idx >= 0 and new_op.get("stopBeforeStart"):
+            prev_start = out.pop(idx)
+            if prev_start.get("stopBeforeStart"):
+                out.insert(idx, {
+                    "opId": uuid.uuid4().hex,
+                    "kind": "stop",
+                    "end": str((prev_start.get("body") or {}).get("start") or ""),
+                    "queuedAt": str(prev_start.get("queuedAt") or new_op.get("queuedAt") or ""),
+                    "summary": "Stop previous timer",
+                })
+                idx += 1
+            manual_body = dict(prev_start.get("body") or {})
+            manual_body["end"] = str((new_op.get("body") or {}).get("start") or "")
+            out.insert(idx, {
+                "opId": uuid.uuid4().hex,
+                "kind": "add-manual",
+                "localId": str(prev_start.get("localId") or ("local:" + uuid.uuid4().hex)),
+                "body": manual_body,
+                "queuedAt": str(prev_start.get("queuedAt") or new_op.get("queuedAt") or ""),
+                "summary": "Log timer",
+            })
+            next_op = dict(new_op)
+            next_op["stopBeforeStart"] = False
+            out.append(next_op)
+            return out
+        out.append(dict(new_op))
+        return out
+
     if kind == "update-running":
         idx = _find_active_local_start_idx(out)
         if idx >= 0:
@@ -1531,6 +1581,12 @@ def _compact_and_append_op(ops, new_op):
         if target_id.startswith("local:"):
             for idx, op in enumerate(out):
                 if op.get("kind") == "add-manual" and str(op.get("localId") or "") == target_id:
+                    out[idx]["body"] = _merge_put_body(op.get("body") or {}, new_op.get("body") or {}, keep_running=False)
+                    return out
+        else:
+            for idx in range(len(out) - 1, -1, -1):
+                op = out[idx]
+                if op.get("kind") == "update-entry" and str(op.get("entryId") or "") == target_id:
                     out[idx]["body"] = _merge_put_body(op.get("body") or {}, new_op.get("body") or {}, keep_running=False)
                     return out
         out.append(dict(new_op))
@@ -1739,16 +1795,63 @@ def _cached_state_with_overlay(config, ident, auth_source, auth_fp):
     return payload
 
 
-def _queued_response(config, ident, auth_source, auth_fp, new_op, note, retry_after=0):
+def _queued_response(config, ident, auth_source, auth_fp, new_op, note, retry_after=0, rate_limited=True):
     enqueue_pending_op(config, ident, auth_fp, new_op)
     payload = _cached_state_with_overlay(config, ident, auth_source, auth_fp)
     payload["ok"] = True
     payload["queued"] = True
-    payload["rateLimited"] = True
+    payload["rateLimited"] = bool(rate_limited)
     payload["note"] = note
     if retry_after and int(retry_after) > 0:
         payload["retryAfterSec"] = int(retry_after)
     return payload
+
+
+def _commit_pending_update(
+    workspace_id,
+    user_id,
+    auth_fingerprint,
+    expected_auth_sig,
+    completed_op_id=None,
+    mutated_op=None,
+):
+    ws_id = str(workspace_id or "").strip()
+    uid = str(user_id or "").strip()
+    fp = str(auth_fingerprint or "").strip()
+    if not ws_id or not uid or not fp:
+        return []
+    with _state_lock():
+        latest_config = load_config()
+        if expected_auth_sig is not None and _auth_signature(latest_config) != expected_auth_sig:
+            return []
+        latest = load_pending(ws_id, user_id=uid, auth_fingerprint=fp)
+        if completed_op_id:
+            cid = str(completed_op_id)
+            for idx, item in enumerate(latest):
+                if str(item.get("opId") or "") == cid:
+                    latest.pop(idx)
+                    break
+        elif mutated_op is not None:
+            mid = str(mutated_op.get("opId") or "")
+            for idx, item in enumerate(latest):
+                if str(item.get("opId") or "") == mid:
+                    latest[idx] = dict(mutated_op)
+                    break
+        if not latest:
+            clear_pending()
+            return []
+        safe_pending = {
+            "version": CACHE_VERSION,
+            "authFingerprint": fp,
+            "userId": uid,
+            "workspaceId": ws_id,
+            "ops": latest,
+        }
+        try:
+            _write_private_json(pending_path(), safe_pending, indent=None)
+        except OSError:
+            pass
+        return latest
 
 
 def _replay_single_op(ident, api, op):
@@ -1805,6 +1908,11 @@ def _replay_single_op(ident, api, op):
         tag_ids = [str(t) for t in (existing.get("tagIds") or []) if t]
         if tag_ids:
             new_body["tagIds"] = tag_ids
+        # Stop succeeded on server; convert op to start so a 429 on POST won't lose the continuation timer.
+        op["kind"] = "start"
+        op["stopBeforeStart"] = False
+        op["body"] = new_body
+        op.pop("splitAt", None)
         api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=new_body)
         return
     if kind == "add-manual":
@@ -1837,22 +1945,43 @@ def flush_pending(config, api, ident, auth_source):
             return {"synced": 0, "remaining": 0, "rateLimited": False, "retryAfter": 0, "error": ""}
         synced = 0
         while ops:
-            current = ops[0]
+            current = dict(ops[0])
             try:
                 _replay_single_op(ident, api, current)
             except ApiError as err:
-                save_pending(ops, ident.workspace_id, ident.user_id, auth_fp, expected_auth_sig=expected_auth_sig)
+                latest = _commit_pending_update(
+                    ident.workspace_id,
+                    ident.user_id,
+                    auth_fp,
+                    expected_auth_sig,
+                    mutated_op=current,
+                )
                 return {
                     "synced": synced,
-                    "remaining": len(ops),
+                    "remaining": len(latest),
                     "rateLimited": err.code == 429,
                     "retryAfter": int(getattr(err, "retry_after", 0) or 0),
                     "error": str(err),
                 }
-            ops.pop(0)
+            ops = _commit_pending_update(
+                ident.workspace_id,
+                ident.user_id,
+                auth_fp,
+                expected_auth_sig,
+                completed_op_id=current.get("opId"),
+            )
             synced += 1
-            save_pending(ops, ident.workspace_id, ident.user_id, auth_fp, expected_auth_sig=expected_auth_sig)
         return {"synced": synced, "remaining": 0, "rateLimited": False, "retryAfter": 0, "error": ""}
+
+
+def _flush_before_mutation(config, api, ident, source, auth_fp):
+    if not load_pending(ident.workspace_id, user_id=ident.user_id, auth_fingerprint=auth_fp):
+        return
+    flush_res = flush_pending(config, api, ident, source)
+    if flush_res["remaining"] > 0:
+        if flush_res["rateLimited"]:
+            raise ApiError(flush_res["error"] or "Clockify rate limit reached", 429, retry_after=flush_res["retryAfter"])
+        raise ApiError(flush_res["error"] or "Earlier queued change failed to sync", 400)
 
 
 def fast_mutation_snapshot(
@@ -1994,6 +2123,16 @@ def _payload_from_cache(config, cred_source, auth_fingerprint=""):
     clients = list(cache.get("clients") or [])
     workspaces = list(cache.get("workspaces") or [])
     has_full = bool(projects or workspaces)
+    cached_run = cache.get("running")
+    clean_run = (
+        dict(cached_run)
+        if (
+            isinstance(cached_run, dict)
+            and cached_run.get("id")
+            and not str(cached_run.get("id") or "").startswith("local:")
+        )
+        else None
+    )
 
     payload = base_payload()
     _apply_prefs_to_payload(payload, config)
@@ -2007,7 +2146,7 @@ def _payload_from_cache(config, cred_source, auth_fingerprint=""):
         "workspaceId": str(cache.get("workspaceId") or ""),
         "workspaceName": str(cache.get("workspaceName") or ""),
         "workspaces": workspaces,
-        "running": None,
+        "running": clean_run,
         "recentEntries": finished,
         "loadedStartDate": str(cache.get("loadedStartDate") or ""),
         "loadedEndDate": str(cache.get("loadedEndDate") or ""),
@@ -2285,6 +2424,9 @@ def cmd_start(args):
     overlaid = _cached_state_with_overlay(config, ident, source, auth_fp)
     has_local_running = isinstance(overlaid.get("running"), dict) and str((overlaid.get("running") or {}).get("id") or "").startswith("local:")
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
+        overlaid = _cached_state_with_overlay(config, ident, source, auth_fp)
+        has_local_running = isinstance(overlaid.get("running"), dict) and str((overlaid.get("running") or {}).get("id") or "").startswith("local:")
         if not has_local_running:
             stopped_raw = stop_running(ident, api)
             stopped_on_server = True
@@ -2292,6 +2434,7 @@ def cmd_start(args):
     except ApiError as err:
         if err.code != 429:
             raise
+        overlaid = _cached_state_with_overlay(config, ident, source, auth_fp)
         if stopped_on_server and stopped_raw:
             _persist_stopped_entry_to_cache(config, api, ident, source, auth_fp, stopped_raw)
         _save_start_defaults(config, args, project_id)
@@ -2361,10 +2504,19 @@ def cmd_stop(args):
             "queuedAt": utc_stamp(now_utc()),
             "summary": "Stop timer",
         }
-        return _queued_response(config, ident, source, auth_fp, op, "Timer stopped locally — will sync when quota resets")
+        return _queued_response(
+            config,
+            ident,
+            source,
+            auth_fp,
+            op,
+            "Timer stopped locally — will sync when quota resets",
+            rate_limited=False,
+        )
 
     end_dt = None
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         if at_val or mins_ago > 0:
             running_entries = time_entries(ident, api, {"in-progress": "true"})
             if not running_entries:
@@ -2427,9 +2579,10 @@ def cmd_discard(args):
             "queuedAt": utc_stamp(now_utc()),
             "summary": "Discard running timer",
         }
-        return _queued_response(config, ident, source, auth_fp, op, "Local timer discarded")
+        return _queued_response(config, ident, source, auth_fp, op, "Local timer discarded", rate_limited=False)
 
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         running_entries = time_entries(ident, api, {"in-progress": "true"})
         if not running_entries:
             payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
@@ -2496,13 +2649,22 @@ def cmd_split_running(args):
             "queuedAt": utc_stamp(now_utc()),
             "summary": "Split timer",
         }
-        return _queued_response(config, ident, source, auth_fp, op, "Timer split locally — will sync when quota resets")
+        return _queued_response(
+            config,
+            ident,
+            source,
+            auth_fp,
+            op,
+            "Timer split locally — will sync when quota resets",
+            rate_limited=False,
+        )
 
     stopped_raw = None
     stopped_on_server = False
     new_body = None
     split_dt = None
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         running_entries = time_entries(ident, api, {"in-progress": "true"})
         if not running_entries:
             payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
@@ -2545,14 +2707,45 @@ def cmd_split_running(args):
             orig_start = parse_stamp(local_run.get("start")) if isinstance(local_run, dict) else None
             if split_dt is None:
                 split_dt = _compute_split_dt(orig_start)
-            op = {
-                "opId": uuid.uuid4().hex,
-                "kind": "split-running",
-                "splitAt": utc_stamp(split_dt),
-                "newLocalId": "local:" + uuid.uuid4().hex,
-                "queuedAt": utc_stamp(now_utc()),
-                "summary": "Split timer",
-            }
+            if isinstance(local_run, dict):
+                split_iso = utc_stamp(split_dt)
+                enqueue_pending_op(config, ident, auth_fp, {
+                    "opId": uuid.uuid4().hex,
+                    "kind": "stop",
+                    "end": split_iso,
+                    "queuedAt": utc_stamp(now_utc()),
+                    "summary": "Stop timer at split",
+                })
+                split_body = {
+                    "start": split_iso,
+                    "description": str(local_run.get("description") or "").strip(),
+                    "billable": bool(local_run.get("billable")),
+                }
+                if local_run.get("projectId"):
+                    split_body["projectId"] = str(local_run["projectId"])
+                    if local_run.get("taskId"):
+                        split_body["taskId"] = str(local_run["taskId"])
+                tids = [str(t) for t in (local_run.get("tagIds") or []) if t]
+                if tids:
+                    split_body["tagIds"] = tids
+                op = {
+                    "opId": uuid.uuid4().hex,
+                    "kind": "start",
+                    "localId": "local:" + uuid.uuid4().hex,
+                    "stopBeforeStart": False,
+                    "body": split_body,
+                    "queuedAt": utc_stamp(now_utc()),
+                    "summary": "Start split timer",
+                }
+            else:
+                op = {
+                    "opId": uuid.uuid4().hex,
+                    "kind": "split-running",
+                    "splitAt": utc_stamp(split_dt),
+                    "newLocalId": "local:" + uuid.uuid4().hex,
+                    "queuedAt": utc_stamp(now_utc()),
+                    "summary": "Split timer",
+                }
         return _queued_response(
             config,
             ident,
@@ -2637,7 +2830,9 @@ def cmd_update_running(args):
     overlaid = _cached_state_with_overlay(config, ident, source, auth_fp)
     local_run = overlaid.get("running")
     if isinstance(local_run, dict) and str(local_run.get("id") or "").startswith("local:"):
-        body = _build_entry_put_body(_view_to_raw(local_run), args, keep_running=True)
+        raw_local = _view_to_raw(local_run)
+        body = _build_entry_put_body(raw_local, args, keep_running=True)
+        body.setdefault("billable", bool(raw_local.get("billable")))
         op = {
             "opId": uuid.uuid4().hex,
             "kind": "update-running",
@@ -2645,10 +2840,19 @@ def cmd_update_running(args):
             "queuedAt": utc_stamp(now_utc()),
             "summary": "Update running timer",
         }
-        return _queued_response(config, ident, source, auth_fp, op, "Running timer updated locally — will sync when quota resets")
+        return _queued_response(
+            config,
+            ident,
+            source,
+            auth_fp,
+            op,
+            "Running timer updated locally — will sync when quota resets",
+            rate_limited=False,
+        )
 
     existing = None
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         running_entries = time_entries(ident, api, {"in-progress": "true"})
         if not running_entries:
             payload = fast_mutation_snapshot(config, api, ident, auth_source=source, running_raw=None)
@@ -2666,6 +2870,7 @@ def cmd_update_running(args):
                 raise
             existing = _view_to_raw(local_run)
         body = _build_entry_put_body(existing, args, keep_running=True)
+        body.setdefault("billable", bool(existing.get("billable")))
         op = {
             "opId": uuid.uuid4().hex,
             "kind": "update-running",
@@ -2718,6 +2923,7 @@ def cmd_add_manual(args):
         body["tagIds"] = tag_ids
 
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
     except ApiError as err:
         if err.code != 429:
@@ -2783,9 +2989,14 @@ def cmd_continue_entry(args):
     stopped_on_server = False
     body = None
     try:
-        if str(args.id).startswith("local:") and cached_match:
+        if str(args.id).startswith("local:"):
+            if not cached_match:
+                raise ApiError("Local entry not found: %s" % args.id)
             existing = _view_to_raw(cached_match)
-        else:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
+        overlaid = _cached_state_with_overlay(config, ident, source, auth_fp)
+        has_local_running = isinstance(overlaid.get("running"), dict) and str((overlaid.get("running") or {}).get("id") or "").startswith("local:")
+        if existing is None:
             existing = api.call("GET", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id)) or {}
         if not has_local_running:
             stopped_raw = stop_running(ident, api)
@@ -2795,6 +3006,7 @@ def cmd_continue_entry(args):
     except ApiError as err:
         if err.code != 429:
             raise
+        overlaid = _cached_state_with_overlay(config, ident, source, auth_fp)
         if body is None:
             if existing is not None:
                 body = _build_continue_body(existing)
@@ -2867,10 +3079,14 @@ def cmd_duplicate_entry(args):
     existing = None
     created_raw = None
     try:
-        if str(args.id).startswith("local:") and cached_match:
+        if str(args.id).startswith("local:"):
+            if not cached_match:
+                raise ApiError("Local entry not found: %s" % args.id)
             body = _build_dup_body(_view_to_raw(cached_match))
+            _flush_before_mutation(config, api, ident, source, auth_fp)
             created_raw = api.call("POST", "/workspaces/%s/time-entries" % ident.workspace_id, body=body)
         else:
+            _flush_before_mutation(config, api, ident, source, auth_fp)
             try:
                 created_raw = api.call("POST", "/workspaces/%s/user/%s/time-entries/%s/duplicate" % (ident.workspace_id, ident.user_id, args.id))
             except ApiError as err:
@@ -2930,7 +3146,9 @@ def cmd_update_entry(args):
     if str(args.id).startswith("local:"):
         if not cached_match:
             raise ApiError("Local entry not found: %s" % args.id)
-        body = _build_entry_put_body(_view_to_raw(cached_match), args, keep_running=False)
+        raw_local = _view_to_raw(cached_match)
+        body = _build_entry_put_body(raw_local, args, keep_running=False)
+        body.setdefault("billable", bool(raw_local.get("billable")))
         op = {
             "opId": uuid.uuid4().hex,
             "kind": "update-entry",
@@ -2939,10 +3157,19 @@ def cmd_update_entry(args):
             "queuedAt": utc_stamp(now_utc()),
             "summary": "Update entry",
         }
-        return _queued_response(config, ident, source, auth_fp, op, "Entry updated locally — will sync when quota resets")
+        return _queued_response(
+            config,
+            ident,
+            source,
+            auth_fp,
+            op,
+            "Entry updated locally — will sync when quota resets",
+            rate_limited=False,
+        )
 
     existing = None
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         existing = api.call("GET", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id)) or {}
         body = _build_entry_put_body(existing, args, keep_running=False)
         updated_raw = api.call("PUT", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id), body=body)
@@ -2954,6 +3181,7 @@ def cmd_update_entry(args):
                 raise
             existing = _view_to_raw(cached_match)
         body = _build_entry_put_body(existing, args, keep_running=False)
+        body.setdefault("billable", bool(existing.get("billable")))
         op = {
             "opId": uuid.uuid4().hex,
             "kind": "update-entry",
@@ -2997,9 +3225,10 @@ def cmd_delete_entry(args):
             "queuedAt": utc_stamp(now_utc()),
             "summary": "Delete entry",
         }
-        return _queued_response(config, ident, source, auth_fp, op, "Local entry deleted")
+        return _queued_response(config, ident, source, auth_fp, op, "Local entry deleted", rate_limited=False)
 
     try:
+        _flush_before_mutation(config, api, ident, source, auth_fp)
         api.call("DELETE", "/workspaces/%s/time-entries/%s" % (ident.workspace_id, args.id))
     except ApiError as err:
         if err.code != 429:
@@ -3252,6 +3481,7 @@ def cmd_switch_workspace(args):
         config["defaultProjectId"] = ""
         config["defaultTaskId"] = ""
         config["defaultTagIds"] = []
+        config["authEpoch"] = uuid.uuid4().hex
         save_config(config)
         clear_cache()
         clear_pending()
@@ -3488,7 +3718,12 @@ def cmd_set_config(args):
     payload["configured"] = bool(cred)
     payload["authSource"] = source
     payload["desktopSessionExpired"] = (not bool(cred)) and _is_desktop_session_expired(config)
-    _attach_quota_and_pending(payload, config)
+    fp = _credential_fingerprint(cred, source) if cred else ""
+    cache = load_cache(payload["workspaceId"], auth_fingerprint=fp) if fp else {}
+    uid = str(cache.get("userId") or "")
+    if not payload["workspaceId"] and cache.get("workspaceId"):
+        payload["workspaceId"] = str(cache.get("workspaceId") or "")
+    _attach_quota_and_pending(payload, config, payload["workspaceId"], uid, fp)
     return payload
 
 

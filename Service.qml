@@ -60,6 +60,7 @@ Item {
   property bool remindWhenIdle: false
   property int idleRemindMin: 30
   property int refreshRequestsPerHour: 10
+  property bool refreshRequestsPerHourConfigured: false
   property int hourlyRequestLimit: 30
   property bool showQuotaInFooter: true
   property int quotaLimit: 30
@@ -100,7 +101,9 @@ Item {
   readonly property bool refreshing: statusProcess.running
   readonly property bool actionBusy: actionProcess.running || keyProcess.running
   readonly property int _widgetRefreshIntervalSec: intSetting("refreshIntervalSec", 360, 15, 3600)
-  readonly property int refreshIntervalSec: refreshRequestsPerHour > 0 ? Math.max(15, Math.min(3600, Math.round(3600 / refreshRequestsPerHour))) : 0
+  readonly property int refreshIntervalSec: (authSource === "api-key" || refreshRequestsPerHourConfigured)
+    ? (refreshRequestsPerHour > 0 ? Math.max(15, Math.min(3600, Math.round(3600 / refreshRequestsPerHour))) : 0)
+    : _widgetRefreshIntervalSec
   readonly property bool ready: helperPath !== ""
 
   signal keyRejected(string message)
@@ -652,6 +655,7 @@ Item {
     remindWhenIdle = payload.remindWhenIdle === true
     idleRemindMin = Number(payload.idleRemindMin || 30)
     if (payload.refreshRequestsPerHour !== undefined) refreshRequestsPerHour = Number(payload.refreshRequestsPerHour)
+    if (payload.refreshRequestsPerHourConfigured !== undefined) refreshRequestsPerHourConfigured = payload.refreshRequestsPerHourConfigured === true
     if (payload.hourlyRequestLimit !== undefined) hourlyRequestLimit = Number(payload.hourlyRequestLimit)
     showQuotaInFooter = payload.showQuotaInFooter !== false
     _applyQuotaAndPending(payload)
@@ -792,9 +796,12 @@ Item {
 
     lastError = String(payload.error || "")
     note = String(payload.note || "")
-    if (payload.queued === true && payload.rateLimited === true) {
-      _engageRateLimitBackoff(payload, note)
-    } else if (!root._nextIsCacheOnly) {
+    if (payload.rateLimited === true) {
+      _engageRateLimitBackoff(payload, note || lastError)
+    } else if (root._nextIsCacheOnly && payload.quotaExhausted === true && Number(payload.quotaResetSec || 0) > 0) {
+      var bootPauseSec = Math.min(900, Math.max(60, Math.round(Number(payload.quotaResetSec))))
+      rateLimitedUntilMs = Math.max(rateLimitedUntilMs, Date.now() + bootPauseSec * 1000)
+    } else if (!root._nextIsCacheOnly && payload.queued !== true) {
       _rateLimitStrikes = 0
       rateLimitedUntilMs = 0
     }
@@ -915,14 +922,17 @@ Item {
     interval: Math.max(15, root.refreshIntervalSec) * 1000
     repeat: true
     running: root.ready && root.configured && root.refreshIntervalSec > 0
-    onTriggered: root.refresh(false, true)
+    onTriggered: {
+      if (root.isPrimaryMonitor) root.refresh(false, true)
+      else root.refreshFromCache()
+    }
   }
 
   Timer {
     id: pendingRetryTimer
     interval: 300000
     repeat: true
-    running: root.ready && root.configured && root.pendingCount > 0
+    running: root.ready && root.isPrimaryMonitor && root.configured && root.pendingCount > 0
     onTriggered: {
       if (!root.isRateLimited() && !root.refreshing && !root.actionBusy) {
         root.syncPending()
@@ -970,7 +980,8 @@ Item {
     interval: 250 + Math.floor(Math.random() * 1200)
     repeat: false
     onTriggered: {
-      if (!root.fullLoaded || (Date.now() - root.lastRefreshMs) >= 60000) {
+      if (!root.isPrimaryMonitor) return
+      if (!root.fullLoaded || (root.refreshIntervalSec > 0 && (Date.now() - root.lastRefreshMs) >= 60000)) {
         root.refresh(!root.fullLoaded, true)
       }
     }
@@ -1079,7 +1090,7 @@ Item {
         return
       }
       if (exitCode !== 0) {
-        if (rollback !== null && root.running === null) root.running = rollback
+        if (rollback !== null && root.configured) root.running = rollback
         root.lastError = root.helperFailure(actionErr.text, exitCode)
         root._startNextAction()
         return
@@ -1094,7 +1105,7 @@ Item {
         return
       }
       var parsed = root.applyPayload(actionOut.text)
-      if (parsed && parsed.ok === false && rollback !== null && root.running === null) {
+      if (parsed && parsed.ok === false && rollback !== null && root.configured) {
         root.running = rollback
       }
       root._startNextAction()

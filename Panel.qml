@@ -971,6 +971,16 @@ Panel {
                 fontSize: Style.font.caption
                 onClicked: clockify.syncPending()
               }
+
+              Button {
+                text: "Clear"
+                bordered: true
+                enabled: !clockify.actionBusy && !clockify.refreshing
+                foreground: root.dim
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: clockify.clearPending()
+              }
             }
           }
 
