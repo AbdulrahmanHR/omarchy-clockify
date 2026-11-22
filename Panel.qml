@@ -3565,65 +3565,7 @@ Panel {
             }
 
             PanelSectionHeader {
-              text: "SYNC & API QUOTA"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            RowLayout {
-              width: parent.width
-              spacing: Style.space(10)
-
-              NumberField {
-                label: "Auto-refresh / hr"
-                value: clockify.refreshRequestsPerHour
-                from: 0
-                to: 60
-                stepSize: 1
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                onModified: function(val) {
-                  clockify.refreshRequestsPerHour = val
-                  clockify.saveConfig({ refreshRequestsPerHour: val })
-                }
-              }
-
-              NumberField {
-                label: "Hourly API limit"
-                value: clockify.hourlyRequestLimit
-                from: 0
-                to: 500
-                stepSize: 5
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                onModified: function(val) {
-                  clockify.hourlyRequestLimit = val
-                  clockify.saveConfig({ hourlyRequestLimit: val })
-                }
-              }
-            }
-
-            Text {
-              width: parent.width
-              textFormat: Text.PlainText
-              text: (clockify.refreshRequestsPerHour > 0
-                ? (clockify.refreshRequestsPerHour + " req/hr · every " + Math.max(1, Math.round(clockify.refreshIntervalSec / 60)) + " min")
-                : "Manual refresh only")
-                + "  ·  "
-                + (clockify.quotaLimit > 0
-                  ? (clockify.quotaRemaining + "/" + clockify.quotaLimit + " requests left (" + clockify.quotaUsed + " used in last hour)"
-                    + (clockify.quotaResetSec > 0 ? " · next slot in " + Math.max(1, Math.ceil(clockify.quotaResetSec / 60)) + "m" : ""))
-                  : ("Unlimited quota (" + clockify.quotaUsed + " used in last hour)"))
-              color: (clockify.quotaLimit > 0 && (clockify.quotaExhausted || clockify.quotaRemaining <= 3)) ? root.urgent : root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
-            PanelSectionHeader {
-              text: "WEEK & ACCOUNT"
+              text: "ACCOUNT & API"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -3692,6 +3634,64 @@ Panel {
               }
             }
 
+            Column {
+              visible: clockify.configured && clockify.authSource === "api-key"
+              width: parent.width
+              spacing: Style.space(6)
+
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(10)
+
+                NumberField {
+                  label: "Auto-refresh / hr"
+                  value: clockify.refreshRequestsPerHour
+                  from: 0
+                  to: 60
+                  stepSize: 1
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onModified: function(val) {
+                    clockify.refreshRequestsPerHour = val
+                    clockify.saveConfig({ refreshRequestsPerHour: val })
+                  }
+                }
+
+                NumberField {
+                  label: "Hourly API limit"
+                  value: clockify.hourlyRequestLimit
+                  from: 0
+                  to: 500
+                  stepSize: 5
+                  foreground: root.foreground
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onModified: function(val) {
+                    clockify.hourlyRequestLimit = val
+                    clockify.saveConfig({ hourlyRequestLimit: val })
+                  }
+                }
+              }
+
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: (clockify.refreshRequestsPerHour > 0
+                  ? (clockify.refreshRequestsPerHour + " req/hr · every " + Math.max(1, Math.round(clockify.refreshIntervalSec / 60)) + " min")
+                  : "Manual refresh only")
+                  + "  ·  "
+                  + (clockify.quotaLimit > 0
+                    ? (clockify.quotaRemaining + "/" + clockify.quotaLimit + " requests left (" + clockify.quotaUsed + " used in last hour)"
+                      + (clockify.quotaResetSec > 0 ? " · next slot in " + Math.max(1, Math.ceil(clockify.quotaResetSec / 60)) + "m" : ""))
+                    : ("Unlimited quota (" + clockify.quotaUsed + " used in last hour)"))
+                color: (clockify.quotaLimit > 0 && (clockify.quotaExhausted || clockify.quotaRemaining <= 3)) ? root.urgent : root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
             RowLayout {
               width: parent.width
               spacing: Style.space(8)
@@ -3749,7 +3749,7 @@ Panel {
             }
 
             Text {
-              visible: clockify.quotaLimit > 0
+              visible: clockify.authSource === "api-key" && clockify.quotaLimit > 0
               textFormat: Text.PlainText
               text: clockify.quotaRemaining + "/" + clockify.quotaLimit + " req"
               color: (clockify.quotaExhausted || clockify.quotaRemaining <= 3)
