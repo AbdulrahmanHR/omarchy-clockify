@@ -61,6 +61,7 @@ Item {
   property int idleRemindMin: 30
   property int refreshRequestsPerHour: 10
   property int hourlyRequestLimit: 30
+  property bool showQuotaInFooter: true
   property int quotaLimit: 30
   property int quotaUsed: 0
   property int quotaRemaining: 30
@@ -488,6 +489,7 @@ Item {
     if (opts.idleRemindMin !== undefined) cmd.push("--idle-remind-min", String(opts.idleRemindMin))
     if (opts.refreshRequestsPerHour !== undefined) cmd.push("--refresh-per-hour", String(opts.refreshRequestsPerHour))
     if (opts.hourlyRequestLimit !== undefined) cmd.push("--hourly-limit", String(opts.hourlyRequestLimit))
+    if (opts.showQuotaInFooter !== undefined) cmd.push("--show-quota-footer", opts.showQuotaInFooter ? "true" : "false")
     runAction(cmd, false, true)
   }
 
@@ -651,6 +653,7 @@ Item {
     idleRemindMin = Number(payload.idleRemindMin || 30)
     if (payload.refreshRequestsPerHour !== undefined) refreshRequestsPerHour = Number(payload.refreshRequestsPerHour)
     if (payload.hourlyRequestLimit !== undefined) hourlyRequestLimit = Number(payload.hourlyRequestLimit)
+    showQuotaInFooter = payload.showQuotaInFooter !== false
     _applyQuotaAndPending(payload)
     if (payload.note) {
       note = String(payload.note)

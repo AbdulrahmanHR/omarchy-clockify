@@ -3690,6 +3690,20 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
               }
+
+              Toggle {
+                width: parent.width
+                label: "Show API quota counter in footer"
+                description: "Display remaining hourly requests (X/30 req) in the panel footer"
+                checked: clockify.showQuotaInFooter
+                foreground: root.foreground
+                accent: root.accent
+                fontFamily: root.fontFamily
+                onClicked: {
+                  clockify.showQuotaInFooter = !clockify.showQuotaInFooter
+                  clockify.saveConfig({ showQuotaInFooter: clockify.showQuotaInFooter })
+                }
+              }
             }
 
             RowLayout {
@@ -3749,7 +3763,7 @@ Panel {
             }
 
             Text {
-              visible: clockify.authSource === "api-key" && clockify.quotaLimit > 0
+              visible: clockify.authSource === "api-key" && clockify.showQuotaInFooter && clockify.quotaLimit > 0
               textFormat: Text.PlainText
               text: clockify.quotaRemaining + "/" + clockify.quotaLimit + " req"
               color: (clockify.quotaExhausted || clockify.quotaRemaining <= 3)

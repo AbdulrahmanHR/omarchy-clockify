@@ -1125,6 +1125,7 @@ def base_payload():
         "idleRemindMin": 30,
         "refreshRequestsPerHour": 10,
         "hourlyRequestLimit": DEFAULT_HOURLY_LIMIT,
+        "showQuotaInFooter": True,
         "quotaLimit": DEFAULT_HOURLY_LIMIT,
         "quotaUsed": 0,
         "quotaRemaining": DEFAULT_HOURLY_LIMIT,
@@ -1183,6 +1184,7 @@ def _apply_prefs_to_payload(payload, config):
         "idleRemindMin": _int_pref(config, "idleRemindMin", 30, 5, 480),
         "refreshRequestsPerHour": _int_pref(config, "refreshRequestsPerHour", 10, 0, 60),
         "hourlyRequestLimit": _int_pref(config, "hourlyRequestLimit", DEFAULT_HOURLY_LIMIT, 0, 5000),
+        "showQuotaInFooter": _bool_pref(config, "showQuotaInFooter", True),
     })
 
 
@@ -3474,6 +3476,8 @@ def cmd_set_config(args):
             config["refreshRequestsPerHour"] = max(0, min(60, int(args.refresh_per_hour)))
         if getattr(args, "hourly_limit", None) is not None:
             config["hourlyRequestLimit"] = max(0, min(5000, int(args.hourly_limit)))
+        if getattr(args, "show_quota_footer", None) is not None:
+            config["showQuotaInFooter"] = _parse_bool_arg(args.show_quota_footer)
 
         save_config(config)
     payload = base_payload()
@@ -3678,6 +3682,7 @@ def build_parser():
     set_cfg.add_argument("--idle-remind-min", type=int, default=None)
     set_cfg.add_argument("--refresh-per-hour", type=int, default=None)
     set_cfg.add_argument("--hourly-limit", type=int, default=None)
+    set_cfg.add_argument("--show-quota-footer", default=None)
     set_cfg.set_defaults(handler=cmd_set_config)
 
     return parser

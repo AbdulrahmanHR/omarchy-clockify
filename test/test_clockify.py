@@ -753,7 +753,7 @@ class AuthIsolationTests(unittest.TestCase):
           loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
           fullLoaded: false, lastFullRefreshMs: 0, lastRefreshMs: 0,
           rateLimitedUntilMs: 0, _rateLimitStrikes: 0, _nextIsCacheOnly: false,
-          refreshRequestsPerHour: 10, hourlyRequestLimit: 30,
+          refreshRequestsPerHour: 10, hourlyRequestLimit: 30, showQuotaInFooter: true,
           quotaLimit: 30, quotaUsed: 0, quotaRemaining: 30, quotaResetSec: 0, quotaExhausted: false,
           pendingCount: 0, pendingSummary: '',
           lastError: '', note: '', lastAutoStoppedId: '', pendingExportOverwritePath: '',
@@ -1076,7 +1076,7 @@ class AuthIsolationTests(unittest.TestCase):
           loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
           fullLoaded: false, lastFullRefreshMs: 0, lastRefreshMs: 0,
           rateLimitedUntilMs: 0, _rateLimitStrikes: 0, _nextIsCacheOnly: false,
-          refreshRequestsPerHour: 10, hourlyRequestLimit: 30,
+          refreshRequestsPerHour: 10, hourlyRequestLimit: 30, showQuotaInFooter: true,
           quotaLimit: 30, quotaUsed: 0, quotaRemaining: 30, quotaResetSec: 0, quotaExhausted: false,
           pendingCount: 0, pendingSummary: '',
           _mutationSeq: 0, _accountSeq: 0, refreshIntervalSec: 360,
@@ -1227,20 +1227,22 @@ class AuthIsolationTests(unittest.TestCase):
             xdg = Path(tmp)
             with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
                 args = clockify.build_parser().parse_args([
-                    "set-config", "--refresh-per-hour", "99", "--hourly-limit", "50",
+                    "set-config", "--refresh-per-hour", "99", "--hourly-limit", "50", "--show-quota-footer", "false",
                 ])
                 res = clockify.cmd_set_config(args)
                 self.assertTrue(res["ok"])
                 self.assertEqual(res["refreshRequestsPerHour"], 60)
                 self.assertEqual(res["hourlyRequestLimit"], 50)
                 self.assertEqual(res["quotaLimit"], 50)
+                self.assertFalse(res["showQuotaInFooter"])
 
                 args_zero = clockify.build_parser().parse_args([
-                    "set-config", "--refresh-per-hour", "0", "--hourly-limit", "0",
+                    "set-config", "--refresh-per-hour", "0", "--hourly-limit", "0", "--show-quota-footer", "true",
                 ])
                 res_zero = clockify.cmd_set_config(args_zero)
                 self.assertEqual(res_zero["refreshRequestsPerHour"], 0)
                 self.assertEqual(res_zero["quotaRemaining"], -1)
+                self.assertTrue(res_zero["showQuotaInFooter"])
 
     def test_pending_queue_compaction_overlay_and_flush(self):
         with tempfile.TemporaryDirectory() as tmp:
