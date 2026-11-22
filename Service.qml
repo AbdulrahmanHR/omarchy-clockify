@@ -59,6 +59,15 @@ Item {
   property int idleStopMin: 240
   property bool remindWhenIdle: false
   property int idleRemindMin: 30
+  property int refreshRequestsPerHour: 10
+  property int hourlyRequestLimit: 30
+  property int quotaLimit: 30
+  property int quotaUsed: 0
+  property int quotaRemaining: 30
+  property int quotaResetSec: 0
+  property bool quotaExhausted: false
+  property int pendingCount: 0
+  property string pendingSummary: ""
 
   // Local Pomodoro session state
   property bool pomodoroRunning: false
@@ -68,6 +77,8 @@ Item {
   // Refresh & cache tracking
   property double lastFullRefreshMs: 0
   property double lastRefreshMs: 0
+  property double rateLimitedUntilMs: 0
+  property int _rateLimitStrikes: 0
   property bool _bootCachePending: true
   property bool _nextIsCacheOnly: false
   property int _mutationSeq: 0
@@ -87,7 +98,8 @@ Item {
   readonly property bool timing: running !== null
   readonly property bool refreshing: statusProcess.running
   readonly property bool actionBusy: actionProcess.running || keyProcess.running
-  readonly property int refreshIntervalSec: intSetting("refreshIntervalSec", 45, 15, 3600)
+  readonly property int _widgetRefreshIntervalSec: intSetting("refreshIntervalSec", 360, 15, 3600)
+  readonly property int refreshIntervalSec: refreshRequestsPerHour > 0 ? Math.max(15, Math.min(3600, Math.round(3600 / refreshRequestsPerHour))) : 0
   readonly property bool ready: helperPath !== ""
 
   signal keyRejected(string message)
@@ -113,8 +125,14 @@ Item {
 
   // ------------------------------------------------------------- commands
 
-  function refresh(full) {
+  function isRateLimited(nowMs) {
+    var t = (nowMs !== undefined && nowMs !== null) ? nowMs : Date.now()
+    return rateLimitedUntilMs > t
+  }
+
+  function refresh(full, isAuto) {
     if (!ready || statusProcess.running || actionProcess.running) return
+    if (isAuto === true && isRateLimited()) return
     _nextIsCacheOnly = false
     var command = [helperPath, "status"]
     if (full === true || (!fullLoaded && configured)) command.push("--full")
@@ -137,22 +155,35 @@ Item {
   function refreshIfStale(wantFull, fullMaxAgeMs) {
     if (!ready) return
     var nowMs = Date.now()
+    if (isRateLimited(nowMs)) return
     if (!configured && desktopSessionExpired && (nowMs - lastRefreshMs) > 2000) {
-      refresh(true)
+      refresh(true, true)
       return
     }
     if (!fullLoaded && configured) {
-      refresh(true)
+      refresh(true, true)
       return
     }
+    if (refreshIntervalSec <= 0) return
     var ageFull = nowMs - lastFullRefreshMs
-    if (wantFull && ageFull > (fullMaxAgeMs || 300000)) {
-      refresh(true)
+    if (wantFull && ageFull > (fullMaxAgeMs || 1800000)) {
+      refresh(true, true)
       return
     }
-    if ((nowMs - lastRefreshMs) > 15000) {
-      refresh(false)
+    var staleMs = Math.max(60000, Math.min(refreshIntervalSec * 1000, 120000))
+    if ((nowMs - lastRefreshMs) > staleMs) {
+      refresh(false, true)
     }
+  }
+
+  function syncPending() {
+    if (!ready) return
+    runAction([helperPath, "sync-pending"], true)
+  }
+
+  function clearPending() {
+    if (!ready) return
+    runAction([helperPath, "clear-pending"], true)
   }
 
   function fetchRange(startDateIso, endDateIso) {
@@ -258,6 +289,7 @@ Item {
   }
 
   function updateRunning(description, projectId, taskId, tagIds, billable, adjustMinutes, startTime) {
+    var prev = running
     var cleanTags = Model.toArray(tagIds)
     if (running && typeof running === "object") {
       var tagMap = {}
@@ -291,7 +323,7 @@ Item {
     if (startTime !== undefined && startTime !== null && String(startTime).trim() !== "") {
       cmd.push("--start", String(startTime).trim())
     }
-    runAction(cmd, true)
+    runAction(cmd, true, false, prev)
   }
 
   function addManual(description, projectId, taskId, tagIds, billable, dateStr, startTime, endTime) {
@@ -454,6 +486,8 @@ Item {
     if (opts.idleStopMin !== undefined) cmd.push("--idle-stop-min", String(opts.idleStopMin))
     if (opts.remindWhenIdle !== undefined) cmd.push("--remind-when-idle", opts.remindWhenIdle ? "true" : "false")
     if (opts.idleRemindMin !== undefined) cmd.push("--idle-remind-min", String(opts.idleRemindMin))
+    if (opts.refreshRequestsPerHour !== undefined) cmd.push("--refresh-per-hour", String(opts.refreshRequestsPerHour))
+    if (opts.hourlyRequestLimit !== undefined) cmd.push("--hourly-limit", String(opts.hourlyRequestLimit))
     runAction(cmd, false, true)
   }
 
@@ -463,6 +497,8 @@ Item {
     _mutationSeq += 1
     _accountSeq += 1
     _actionQueue = []
+    rateLimitedUntilMs = 0
+    _rateLimitStrikes = 0
     if (statusProcess.running) statusProcess.running = false
     note = "Validating API key…"
     keyProcess.accountSeqAtStart = root._accountSeq
@@ -475,6 +511,8 @@ Item {
     if (!ready) return
     _accountSeq += 1
     _actionQueue = []
+    rateLimitedUntilMs = 0
+    _rateLimitStrikes = 0
     runAction([helperPath, "connect-desktop"], true, false, false, root._accountSeq)
   }
 
@@ -482,6 +520,8 @@ Item {
     if (!ready) return
     _accountSeq += 1
     _actionQueue = []
+    rateLimitedUntilMs = 0
+    _rateLimitStrikes = 0
     note = "Disconnecting…"
     runAction([helperPath, "clear-key"], true, false, false, root._accountSeq)
   }
@@ -609,10 +649,42 @@ Item {
     idleStopMin = Number(payload.idleStopMin || 240)
     remindWhenIdle = payload.remindWhenIdle === true
     idleRemindMin = Number(payload.idleRemindMin || 30)
+    if (payload.refreshRequestsPerHour !== undefined) refreshRequestsPerHour = Number(payload.refreshRequestsPerHour)
+    if (payload.hourlyRequestLimit !== undefined) hourlyRequestLimit = Number(payload.hourlyRequestLimit)
+    _applyQuotaAndPending(payload)
     if (payload.note) {
       note = String(payload.note)
       noteTimer.restart()
     }
+  }
+
+  function _applyQuotaAndPending(payload) {
+    if (!payload) return
+    if (payload.quotaLimit !== undefined) quotaLimit = Number(payload.quotaLimit)
+    if (payload.quotaUsed !== undefined) quotaUsed = Number(payload.quotaUsed)
+    if (payload.quotaRemaining !== undefined) quotaRemaining = Number(payload.quotaRemaining)
+    if (payload.quotaResetSec !== undefined) quotaResetSec = Number(payload.quotaResetSec)
+    if (payload.quotaExhausted !== undefined) quotaExhausted = payload.quotaExhausted === true
+    if (payload.pendingCount !== undefined) pendingCount = Number(payload.pendingCount)
+    if (payload.pendingSummary !== undefined) pendingSummary = String(payload.pendingSummary || "")
+  }
+
+  function _engageRateLimitBackoff(payload, msgText) {
+    var lower = String(msgText || "").toLowerCase()
+    _rateLimitStrikes = Math.min(_rateLimitStrikes + 1, 4)
+    var retryAfter = Number(payload.retryAfterSec || 0)
+    var cooldownSec = 0
+    if (isFinite(retryAfter) && retryAfter > 0) {
+      cooldownSec = Math.max(60, Math.min(3600, Math.round(retryAfter)))
+    } else if (lower.indexOf("per hour") !== -1 || lower.indexOf("one hour") !== -1 || lower.indexOf("quota") !== -1) {
+      var hourlySteps = [300, 600, 900, 900]
+      cooldownSec = hourlySteps[_rateLimitStrikes - 1]
+    } else {
+      var burstSteps = [60, 180, 300, 600]
+      cooldownSec = burstSteps[_rateLimitStrikes - 1]
+    }
+    rateLimitedUntilMs = Date.now() + cooldownSec * 1000
+    return Math.max(1, Math.round(cooldownSec / 60))
   }
 
   function clearAccountData() {
@@ -633,6 +705,14 @@ Item {
     fetchedAt = ""
     fullLoaded = false
     lastFullRefreshMs = 0
+    rateLimitedUntilMs = 0
+    _rateLimitStrikes = 0
+    pendingCount = 0
+    pendingSummary = ""
+    quotaUsed = 0
+    quotaRemaining = hourlyRequestLimit
+    quotaResetSec = 0
+    quotaExhausted = false
     workspaceName = ""
     workspaceId = ""
     userName = ""
@@ -655,10 +735,21 @@ Item {
   function applyPayload(raw) {
     var payload = Model.parsePayload(raw)
 
+    _applyQuotaAndPending(payload)
+
     if (payload.ok === false) {
       var prevAuthSource = authSource
       lastError = String(payload.error || "Clockify request failed")
       note = ""
+      var errLower = lastError.toLowerCase()
+      var isRateLimit = payload.rateLimited === true
+        || Number(payload.httpStatus || 0) === 429
+        || errLower.indexOf("rate limit") !== -1
+        || errLower.indexOf("30 requests per hour") !== -1
+      if (isRateLimit) {
+        var pauseMin = _engageRateLimitBackoff(payload, lastError)
+        lastError = lastError + " (background sync paused for " + pauseMin + "m)"
+      }
       if (payload.configured !== undefined) configured = payload.configured === true
       if (payload.desktopSessionExpired !== undefined) desktopSessionExpired = payload.desktopSessionExpired === true
       if (payload.authSource !== undefined) authSource = String(payload.authSource || "")
@@ -698,6 +789,12 @@ Item {
 
     lastError = String(payload.error || "")
     note = String(payload.note || "")
+    if (payload.queued === true && payload.rateLimited === true) {
+      _engageRateLimitBackoff(payload, note)
+    } else if (!root._nextIsCacheOnly) {
+      _rateLimitStrikes = 0
+      rateLimitedUntilMs = 0
+    }
     configured = nextConfigured
     desktopSessionExpired = (!nextConfigured && payload.desktopSessionExpired === true)
     authSource = nextAuthSource
@@ -776,6 +873,12 @@ Item {
     loadedStartDate = String(payload.loadedStartDate || "")
     loadedEndDate = String(payload.loadedEndDate || "")
     fetchedAt = String(payload.fetchedAt || "")
+    if (root._nextIsCacheOnly && payload.fetchedAt) {
+      var cachedFetchedMs = Date.parse(String(payload.fetchedAt))
+      if (isFinite(cachedFetchedMs) && cachedFetchedMs > 0) {
+        root.lastRefreshMs = Math.max(root.lastRefreshMs, cachedFetchedMs)
+      }
+    }
 
     applyConfigPayload(payload)
 
@@ -786,7 +889,14 @@ Item {
       clients = Array.isArray(payload.clients) ? payload.clients : []
       workspaceName = String(payload.workspaceName || "")
       fullLoaded = true
-      if (!root._nextIsCacheOnly) root.lastFullRefreshMs = Date.now()
+      if (!root._nextIsCacheOnly) {
+        root.lastFullRefreshMs = Date.now()
+      } else if (payload.fullLoadedAt) {
+        var cachedFullMs = Date.parse(String(payload.fullLoadedAt))
+        if (isFinite(cachedFullMs) && cachedFullMs > 0) {
+          root.lastFullRefreshMs = cachedFullMs
+        }
+      }
     } else if (accountChanged) {
       Qt.callLater(function() {
         if (root.configured && !root.fullLoaded) root.refresh(true)
@@ -799,10 +909,22 @@ Item {
 
   Timer {
     id: refreshTimer
-    interval: root.refreshIntervalSec * 1000
+    interval: Math.max(15, root.refreshIntervalSec) * 1000
     repeat: true
-    running: root.ready && root.configured
-    onTriggered: root.refresh(false)
+    running: root.ready && root.configured && root.refreshIntervalSec > 0
+    onTriggered: root.refresh(false, true)
+  }
+
+  Timer {
+    id: pendingRetryTimer
+    interval: 300000
+    repeat: true
+    running: root.ready && root.configured && root.pendingCount > 0
+    onTriggered: {
+      if (!root.isRateLimited() && !root.refreshing && !root.actionBusy) {
+        root.syncPending()
+      }
+    }
   }
 
   // Desktop-session mode only: the Desktop app refreshes its 60-minute token when its
@@ -844,7 +966,11 @@ Item {
     id: bootLiveTimer
     interval: 250 + Math.floor(Math.random() * 1200)
     repeat: false
-    onTriggered: root.refresh(!root.fullLoaded)
+    onTriggered: {
+      if (!root.fullLoaded || (Date.now() - root.lastRefreshMs) >= 60000) {
+        root.refresh(!root.fullLoaded, true)
+      }
+    }
   }
 
   Timer {

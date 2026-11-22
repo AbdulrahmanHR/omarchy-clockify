@@ -751,7 +751,11 @@ class AuthIsolationTests(unittest.TestCase):
           running: null, recentEntries: [], todaySeconds: 0, weekSeconds: 0, monthSeconds: 0,
           todayBillableSeconds: 0, weekBillableSeconds: 0, monthBillableSeconds: 0,
           loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
-          fullLoaded: false, lastFullRefreshMs: 0, _nextIsCacheOnly: false,
+          fullLoaded: false, lastFullRefreshMs: 0, lastRefreshMs: 0,
+          rateLimitedUntilMs: 0, _rateLimitStrikes: 0, _nextIsCacheOnly: false,
+          refreshRequestsPerHour: 10, hourlyRequestLimit: 30,
+          quotaLimit: 30, quotaUsed: 0, quotaRemaining: 30, quotaResetSec: 0, quotaExhausted: false,
+          pendingCount: 0, pendingSummary: '',
           lastError: '', note: '', lastAutoStoppedId: '', pendingExportOverwritePath: '',
           pendingExportRequest: null,
           defaultProjectId: '', defaultTaskId: '', defaultTagIds: [], defaultBillable: false,
@@ -768,6 +772,8 @@ class AuthIsolationTests(unittest.TestCase):
         vm.runInContext(
           [
             extractFn('applyConfigPayload'),
+            extractFn('_applyQuotaAndPending'),
+            extractFn('_engageRateLimitBackoff'),
             extractFn('clearAccountData'),
             extractFn('_identityChanged'),
             extractFn('applyPayload'),
@@ -938,6 +944,417 @@ class AuthIsolationTests(unittest.TestCase):
             "onHistoryQueryChanged: invalidatePendingExportOverwrite()",
         ):
             self.assertIn(handler, panel_src)
+
+    def test_rate_limit_message_payload_and_single_request_snapshot(self):
+        custom_body = json.dumps({
+            "message": "Too many requests!",
+            "code": 429,
+            "customMessage": "You have reached the limit of 30 requests per hour allowed on a Free plan.",
+        })
+        self.assertEqual(
+            clockify.status_message(429, custom_body),
+            "You have reached the limit of 30 requests per hour allowed on a Free plan.",
+        )
+        self.assertEqual(
+            clockify.status_message(429, json.dumps({"message": "Too many requests!", "code": 429})),
+            "Clockify rate limit reached, try again later",
+        )
+        self.assertEqual(clockify._parse_retry_after("120"), 120)
+        self.assertEqual(clockify._parse_retry_after("99999"), 3600)
+        self.assertEqual(clockify._parse_retry_after("invalid"), 0)
+
+        # main() exposes httpStatus, rateLimited, and retryAfterSec on 429 ApiError
+        buf = __import__("io").StringIO()
+        with mock.patch.object(clockify, "load_config", return_value={}), \
+             mock.patch.object(clockify, "resolve_auth", return_value=("k", "X-Api-Key", "api-key")), \
+             mock.patch.object(clockify, "cmd_status", side_effect=clockify.ApiError("Free plan limit", 429, retry_after=300)), \
+             mock.patch.object(sys, "stdout", buf):
+            rc = clockify.main(["status"])
+        self.assertEqual(rc, 0)
+        err_payload = json.loads(buf.getvalue())
+        self.assertFalse(err_payload["ok"])
+        self.assertEqual(err_payload["httpStatus"], 429)
+        self.assertTrue(err_payload["rateLimited"])
+        self.assertEqual(err_payload["retryAfterSec"], 300)
+
+        # snapshot(full=False) performs exactly one time_entries call and extracts running + finished entries
+        ident = clockify.Identity("u1", "w1", "Tester")
+        raw_entries = [
+            {
+                "id": "run-1",
+                "description": "Active task",
+                "projectId": "",
+                "taskId": "",
+                "tagIds": [],
+                "billable": True,
+                "timeInterval": {"start": "2026-11-22T12:00:00Z", "end": None},
+            },
+            {
+                "id": "done-1",
+                "description": "Finished task",
+                "projectId": "",
+                "taskId": "",
+                "tagIds": [],
+                "billable": False,
+                "timeInterval": {"start": "2026-11-22T10:00:00Z", "end": "2026-11-22T11:00:00Z"},
+            },
+        ]
+        api = mock.MagicMock()
+        api.credential = "k"
+        api.auth_source = "api-key"
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False), \
+                 mock.patch.object(clockify, "time_entries", return_value=raw_entries) as mock_te:
+                snap = clockify.snapshot({"workspaceId": "w1"}, api, ident, full=False, auth_source="api-key", use_cache=False)
+        mock_te.assert_called_once()
+        self.assertIsNotNone(snap["running"])
+        self.assertEqual(snap["running"]["id"], "run-1")
+        self.assertEqual([e["id"] for e in snap["recentEntries"]], ["done-1"])
+
+        # Metadata fetchers re-raise 429 instead of returning empty lists
+        api_429 = mock.MagicMock()
+        api_429.call.side_effect = clockify.ApiError("Rate limited", 429)
+        with self.assertRaises(clockify.ApiError) as ctx_tags:
+            clockify.fetch_tags("w1", api_429)
+        self.assertEqual(ctx_tags.exception.code, 429)
+        with self.assertRaises(clockify.ApiError) as ctx_clients:
+            clockify.fetch_clients("w1", api_429)
+        self.assertEqual(ctx_clients.exception.code, 429)
+
+        proj_api = mock.MagicMock()
+        proj_api.call.side_effect = [
+            [{"id": "p1", "name": "Alpha", "color": "#000", "clientId": "", "clientName": "", "billable": False, "public": True}],
+            clockify.ApiError("Rate limited", 429),
+        ]
+        with self.assertRaises(clockify.ApiError) as ctx_proj:
+            clockify.fetch_projects_with_tasks("w1", proj_api)
+        self.assertEqual(ctx_proj.exception.code, 429)
+
+    def test_service_qml_rate_limit_backoff_and_cache_timestamps(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        service_path = PLUGIN_DIR / "Service.qml"
+        model_path = PLUGIN_DIR / "Model.js"
+        script = f"""
+        const fs = require('fs');
+        const vm = require('vm');
+        const qml = fs.readFileSync({json.dumps(str(service_path))}, 'utf8');
+
+        function extractFn(name) {{
+          const start = qml.indexOf('function ' + name + '(');
+          if (start === -1) throw new Error('Missing function ' + name);
+          let depth = 0;
+          let inBody = false;
+          for (let i = start; i < qml.length; i++) {{
+            const ch = qml[i];
+            if (ch === '{{') {{ depth++; inBody = true; }}
+            else if (ch === '}}') {{
+              depth--;
+              if (inBody && depth === 0) return qml.slice(start, i + 1);
+            }}
+          }}
+          throw new Error('Unclosed function ' + name);
+        }}
+
+        const Model = {{}};
+        vm.createContext(Model);
+        vm.runInContext(fs.readFileSync({json.dumps(str(model_path))}, 'utf8'), Model);
+
+        const ctx = {{
+          Model,
+          noteTimer: {{ restart() {{}} }},
+          Qt: {{ callLater(fn) {{ fn(); }} }},
+          helperPath: '/tmp/clockify.py',
+          ready: true,
+          configured: true, desktopSessionExpired: false, authSource: 'api-key',
+          userId: 'u1', userName: 'Tester', userEmail: 't@example.com',
+          workspaceId: 'w1', workspaceName: 'Main', workspaces: [], projects: [], tags: [], clients: [],
+          running: null, recentEntries: [], todaySeconds: 0, weekSeconds: 0, monthSeconds: 0,
+          todayBillableSeconds: 0, weekBillableSeconds: 0, monthBillableSeconds: 0,
+          loadedStartDate: '', loadedEndDate: '', fetchedAt: '',
+          fullLoaded: false, lastFullRefreshMs: 0, lastRefreshMs: 0,
+          rateLimitedUntilMs: 0, _rateLimitStrikes: 0, _nextIsCacheOnly: false,
+          refreshRequestsPerHour: 10, hourlyRequestLimit: 30,
+          quotaLimit: 30, quotaUsed: 0, quotaRemaining: 30, quotaResetSec: 0, quotaExhausted: false,
+          pendingCount: 0, pendingSummary: '',
+          _mutationSeq: 0, _accountSeq: 0, refreshIntervalSec: 360,
+          lastError: '', note: '', lastAutoStoppedId: '', pendingExportOverwritePath: '',
+          pendingExportRequest: null,
+          defaultProjectId: '', defaultTaskId: '', defaultTagIds: [], defaultBillable: false,
+          weekStart: 'monday', panelWidth: 560, panelHeight: 740, wrapText: true,
+          timeStepMinutes: 5, quickStepMinutes: 1, durationFormat: 'compact',
+          groupSimilarEntries: true, pomodoroEnabled: false, pomodoroAutoTimer: true,
+          pomodoroWorkMin: 25, pomodoroBreakMin: 5, dailyTargetHours: 8, weeklyTargetHours: 40,
+          stopOnIdle: false, idleStopMin: 240, remindWhenIdle: false, idleRemindMin: 30,
+          statusProcess: {{ running: false, seqAtStart: 0, accountSeqAtStart: 0, command: [] }},
+          actionProcess: {{ running: false }},
+          pythonCommand(parts) {{ return ['python3'].concat(parts); }},
+        }};
+        ctx.root = ctx;
+        vm.createContext(ctx);
+        vm.runInContext(
+          [
+            extractFn('applyConfigPayload'),
+            extractFn('_applyQuotaAndPending'),
+            extractFn('_engageRateLimitBackoff'),
+            extractFn('clearAccountData'),
+            extractFn('_identityChanged'),
+            extractFn('applyPayload'),
+            extractFn('isRateLimited'),
+            extractFn('refresh'),
+            extractFn('refreshIfStale'),
+          ].join('\\n'),
+          ctx
+        );
+
+        // Cache-only boot payload populates lastRefreshMs and lastFullRefreshMs
+        ctx._nextIsCacheOnly = true;
+        ctx.applyPayload(JSON.stringify({{
+          ok: true, configured: true, authSource: 'api-key',
+          userId: 'u1', userName: 'Tester', workspaceId: 'w1',
+          fullLoaded: true,
+          fetchedAt: '2026-11-22T14:00:00Z',
+          fullLoadedAt: '2026-11-22T13:30:00Z',
+          workspaces: [{{ id: 'w1', name: 'Main' }}],
+          projects: [{{ id: 'p1', name: 'Alpha' }}],
+          tags: [], clients: [], recentEntries: [],
+        }}));
+        ctx._nextIsCacheOnly = false;
+        if (ctx.lastRefreshMs !== Date.parse('2026-11-22T14:00:00Z')) {{
+          throw new Error('Cache fetchedAt did not populate lastRefreshMs');
+        }}
+        if (ctx.lastFullRefreshMs !== Date.parse('2026-11-22T13:30:00Z')) {{
+          throw new Error('Cache fullLoadedAt did not populate lastFullRefreshMs');
+        }}
+
+        // 429 payload engages cooldown, suppresses auto refresh, but allows manual refresh
+        ctx.applyPayload(JSON.stringify({{
+          ok: false, configured: true, authSource: 'api-key',
+          httpStatus: 429, rateLimited: true,
+          error: 'You have reached the limit of 30 requests per hour allowed on a Free plan.',
+        }}));
+        if (!ctx.isRateLimited() || ctx._rateLimitStrikes !== 1) {{
+          throw new Error('429 did not activate rate limit backoff');
+        }}
+        if (!ctx.lastError.includes('background sync paused for 5m')) {{
+          throw new Error('429 did not append pause duration to lastError: ' + ctx.lastError);
+        }}
+
+        ctx.statusProcess.running = false;
+        ctx.refresh(false, true);
+        if (ctx.statusProcess.running) {{
+          throw new Error('Automatic refresh should be suppressed during rate-limit cooldown');
+        }}
+        ctx.lastRefreshMs = 0;
+        ctx.refreshIfStale(true, 1000);
+        if (ctx.statusProcess.running) {{
+          throw new Error('refreshIfStale should be suppressed during rate-limit cooldown');
+        }}
+        ctx.refresh(true);
+        if (!ctx.statusProcess.running) {{
+          throw new Error('Manual refresh should still be allowed during rate-limit cooldown');
+        }}
+        ctx.statusProcess.running = false;
+
+        // Live ok:true clears rate limit state
+        ctx.applyPayload(JSON.stringify({{
+          ok: true, configured: true, authSource: 'api-key',
+          userId: 'u1', userName: 'Tester', workspaceId: 'w1',
+          fullLoaded: false, recentEntries: [],
+          quotaLimit: 30, quotaUsed: 5, quotaRemaining: 25, quotaResetSec: 1200, quotaExhausted: false,
+          pendingCount: 0, pendingSummary: '',
+        }}));
+        if (ctx.isRateLimited() || ctx._rateLimitStrikes !== 0 || ctx.lastError !== '') {{
+          throw new Error('Live success did not clear rate limit state');
+        }}
+        if (ctx.quotaRemaining !== 25 || ctx.quotaLimit !== 30 || ctx.pendingCount !== 0) {{
+          throw new Error('Live success did not apply quota/pending fields');
+        }}
+
+        // Queued mutation under 429 engages backoff WITHOUT setting lastError
+        ctx.applyPayload(JSON.stringify({{
+          ok: true, queued: true, rateLimited: true,
+          configured: true, authSource: 'api-key',
+          userId: 'u1', userName: 'Tester', workspaceId: 'w1',
+          note: 'Timer started locally (Clockify quota reached) — will sync automatically',
+          quotaLimit: 30, quotaUsed: 30, quotaRemaining: 0, quotaResetSec: 1800, quotaExhausted: true,
+          pendingCount: 1, pendingSummary: '1 change saved locally',
+          fullLoaded: false, recentEntries: [],
+        }}));
+        if (!ctx.isRateLimited() || ctx.lastError !== '' || ctx.pendingCount !== 1 || ctx.quotaRemaining !== 0) {{
+          throw new Error('Queued 429 response did not update backoff/pending without error');
+        }}
+        """
+        proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr or proc.stdout)
+
+        service_src = service_path.read_text(encoding="utf-8")
+        self.assertIn("refreshRequestsPerHour > 0 ? Math.max(15, Math.min(3600, Math.round(3600 / refreshRequestsPerHour))) : 0", service_src)
+
+    def test_quota_ledger_rolling_window_and_exhaustion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                now = 1000000
+                clockify.record_workspace_request("w1", 200, now_ts=now - 3700)
+                clockify.record_workspace_request("w1", 200, now_ts=now - 100)
+                clockify.record_workspace_request("w1", 200, now_ts=now - 50)
+                st = clockify.quota_status("w1", {"hourlyRequestLimit": 30}, now_ts=now)
+                self.assertEqual(st["quotaUsed"], 2)
+                self.assertEqual(st["quotaRemaining"], 28)
+                self.assertFalse(st["quotaExhausted"])
+                self.assertEqual(st["quotaResetSec"], 3500)
+
+                clockify.record_workspace_request("w1", 429, retry_after=180, now_ts=now)
+                st_ex = clockify.quota_status("w1", {"hourlyRequestLimit": 30}, now_ts=now + 10)
+                self.assertEqual(st_ex["quotaRemaining"], 0)
+                self.assertTrue(st_ex["quotaExhausted"])
+                self.assertGreater(st_ex["quotaResetSec"], 0)
+
+                clockify.record_workspace_request("w1", 200, now_ts=now + 20)
+                st_ok = clockify.quota_status("w1", {"hourlyRequestLimit": 30}, now_ts=now + 21)
+                self.assertFalse(st_ok["quotaExhausted"])
+                self.assertEqual(st_ok["quotaRemaining"], 27)
+
+                st_unlim = clockify.quota_status("w1", {"hourlyRequestLimit": 0}, now_ts=now + 21)
+                self.assertEqual(st_unlim["quotaRemaining"], -1)
+                self.assertFalse(st_unlim["quotaExhausted"])
+
+    def test_set_config_refresh_per_hour_and_hourly_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                args = clockify.build_parser().parse_args([
+                    "set-config", "--refresh-per-hour", "99", "--hourly-limit", "50",
+                ])
+                res = clockify.cmd_set_config(args)
+                self.assertTrue(res["ok"])
+                self.assertEqual(res["refreshRequestsPerHour"], 60)
+                self.assertEqual(res["hourlyRequestLimit"], 50)
+                self.assertEqual(res["quotaLimit"], 50)
+
+                args_zero = clockify.build_parser().parse_args([
+                    "set-config", "--refresh-per-hour", "0", "--hourly-limit", "0",
+                ])
+                res_zero = clockify.cmd_set_config(args_zero)
+                self.assertEqual(res_zero["refreshRequestsPerHour"], 0)
+                self.assertEqual(res_zero["quotaRemaining"], -1)
+
+    def test_pending_queue_compaction_overlay_and_flush(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xdg = Path(tmp)
+            cfg_file = xdg / "omarchy" / "clockify.json"
+            cfg_file.parent.mkdir(parents=True)
+            cfg_file.write_text(json.dumps({"apiKey": "k1", "workspaceId": "w1"}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg), "CLOCKIFY_API_KEY": ""}, clear=False):
+                ident = clockify.Identity("u1", "w1", "Tester")
+                api = mock.MagicMock()
+                api.credential = "k1"
+                api.auth_source = "api-key"
+                api.good_host = "1.2.3.4"
+                api.call.side_effect = clockify.ApiError("Free plan limit", 429, retry_after=300)
+
+                clockify.save_cache({
+                    "configured": True,
+                    "userId": "u1",
+                    "userName": "Tester",
+                    "workspaceId": "w1",
+                    "workspaceName": "Main",
+                    "projects": [{"id": "p1", "name": "Alpha", "color": "#039BE5", "tasks": []}],
+                    "tags": [],
+                    "clients": [],
+                    "workspaces": [{"id": "w1", "name": "Main"}],
+                    "recentEntries": [],
+                    "loadedStartDate": "2026-11-01",
+                    "loadedEndDate": "2026-11-22",
+                    "fullLoaded": True,
+                })
+
+                with mock.patch.object(clockify, "open_client", return_value=(api, ident, "api-key")), \
+                     mock.patch.object(clockify, "stop_running", side_effect=clockify.ApiError("Free plan limit", 429, retry_after=300)):
+                    # 1. Start while 429 -> queued local running timer
+                    r1 = clockify.cmd_start(clockify.build_parser().parse_args([
+                        "start", "--description", "Initial", "--project", "p1", "--start", "09:00",
+                    ]))
+                    self.assertTrue(r1["ok"])
+                    self.assertTrue(r1["queued"])
+                    self.assertEqual(r1["pendingCount"], 1)
+                    self.assertIsNotNone(r1["running"])
+                    self.assertTrue(r1["running"]["id"].startswith("local:"))
+                    self.assertTrue(r1["running"]["pendingSync"])
+
+                    # 2. Update local running timer -> merges into start op (still 1 op, 0 extra calls)
+                    api.call.reset_mock()
+                    r2 = clockify.cmd_update_running(clockify.build_parser().parse_args([
+                        "update-running", "--description", "Updated work",
+                    ]))
+                    self.assertEqual(r2["pendingCount"], 1)
+                    self.assertEqual(r2["running"]["description"], "Updated work")
+                    api.call.assert_not_called()
+
+                    # 3. Stop local running timer -> collapses start+stop into 1 add-manual op
+                    r3 = clockify.cmd_stop(clockify.build_parser().parse_args(["stop", "--at", "10:30"]))
+                    self.assertEqual(r3["pendingCount"], 1)
+                    self.assertIsNone(r3["running"])
+                    self.assertEqual(len(r3["recentEntries"]), 1)
+                    self.assertEqual(r3["recentEntries"][0]["description"], "Updated work")
+                    self.assertEqual(r3["recentEntries"][0]["seconds"], 5400)
+                    self.assertGreaterEqual(r3["todaySeconds"], 5400)
+                    api.call.assert_not_called()
+
+                    # Verify server cache stays clean (no synthetic local: entries leaked into clockify-cache.json)
+                    clean_cache = clockify.load_cache("w1", user_id="u1")
+                    self.assertEqual(clean_cache["recentEntries"], [])
+
+                    # 4. Start + Discard cancels out completely (0 ops)
+                    r4 = clockify.cmd_start(clockify.build_parser().parse_args(["start", "--description", "Temp"]))
+                    self.assertEqual(r4["pendingCount"], 2)
+                    r5 = clockify.cmd_discard(clockify.build_parser().parse_args(["discard"]))
+                    self.assertEqual(r5["pendingCount"], 1)
+                    self.assertIsNone(r5["running"])
+
+                    # 5. Add manual while 429, update in place, then delete local entry
+                    r6 = clockify.cmd_add_manual(clockify.build_parser().parse_args([
+                        "add-manual", "--start", "11:00", "--end", "12:00", "--description", "Manual",
+                    ]))
+                    self.assertEqual(r6["pendingCount"], 2)
+                    manual_id = next(e["id"] for e in r6["recentEntries"] if e["description"] == "Manual")
+                    r7 = clockify.cmd_update_entry(clockify.build_parser().parse_args([
+                        "update-entry", "--id", manual_id, "--description", "Manual v2",
+                    ]))
+                    self.assertEqual(r7["pendingCount"], 2)
+                    self.assertTrue(any(e["description"] == "Manual v2" for e in r7["recentEntries"]))
+                    r8 = clockify.cmd_delete_entry(clockify.build_parser().parse_args([
+                        "delete-entry", "--id", manual_id,
+                    ]))
+                    self.assertEqual(r8["pendingCount"], 1)
+
+                # 6. Flush remaining 1 op: first simulate 429 still active, then success
+                api_flush = mock.MagicMock()
+                api_flush.credential = "k1"
+                api_flush.auth_source = "api-key"
+                api_flush.call.side_effect = clockify.ApiError("Still limited", 429)
+                res_fail = clockify.flush_pending(clockify.load_config(), api_flush, ident, "api-key")
+                self.assertEqual(res_fail["synced"], 0)
+                self.assertEqual(res_fail["remaining"], 1)
+                self.assertTrue(res_fail["rateLimited"])
+
+                api_flush.call.side_effect = None
+                api_flush.call.return_value = {"id": "srv-1"}
+                res_ok = clockify.flush_pending(clockify.load_config(), api_flush, ident, "api-key")
+                self.assertEqual(res_ok["synced"], 1)
+                self.assertEqual(res_ok["remaining"], 0)
+                self.assertFalse(clockify.pending_path().exists())
+
+                # 7. Disconnect clears pending file
+                clockify.enqueue_pending_op(clockify.load_config(), ident, clockify._credential_fingerprint("k1", "api-key"), {
+                    "opId": "x1", "kind": "stop", "end": "2026-11-22T12:00:00Z", "queuedAt": "2026-11-22T12:00:00Z",
+                })
+                self.assertTrue(clockify.pending_path().exists())
+                clockify.cmd_clear_key(clockify.build_parser().parse_args(["clear-key"]))
+                self.assertFalse(clockify.pending_path().exists())
 
 
 if __name__ == "__main__":

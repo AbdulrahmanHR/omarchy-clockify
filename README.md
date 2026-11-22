@@ -13,7 +13,8 @@ A full-featured [Clockify](https://clockify.me) time tracker, analytics dashboar
 - **Interactive Analytics Dashboard.** Browse `Day`, `Week`, `Month`, `Year`, `All`, or `Custom` date ranges with `‹` / `›` period stepping, configurable duration display (`Compact`, `Full`, `Decimal`), toggleable grouping of identical same-day entries (`N×` badge with expandable rows), 4 KPI cards, an interactive activity bar chart, a stacked distribution bar (`By Project`, `By Task`, `By Tag`, `By Day`), multi-filter controls, paginated date groups, and CSV export to `~/Downloads/`.
 - **Workspace & Resource Management.** Filter, create, start from, archive, mark tasks Done, or delete **Projects**, **Tasks**, **Tags**, and **Clients** from the Manage tab, and switch between Clockify **Workspaces**.
 - **Pomodoro & Idle Automation.** Built-in Pomodoro focus/break cycle with optional timer auto-sync (`Start` starts focus timer, `Break` stops it, `Skip` jumps phase) plus idle reminder notifications and auto-stop limits for forgotten timers.
-- **Fast Caching & Parallel Sync.** Non-sensitive metadata and recent entries cache (`0600` in `~/.config/omarchy/clockify-cache.json`) gives instant startup prefill, 14-day incremental background sync, parallel `--full` fetching, and single-request mutation updates.
+- **Fast Caching & Parallel Sync.** Non-sensitive metadata and recent entries cache (`0600` in `~/.config/omarchy/clockify-cache.json`) gives instant startup prefill, 14-day incremental background sync (single windowed `time-entries` request), parallel `--full` fetching, and single-request mutation updates.
+- **Free-Plan Quota Resilience & Offline Queue.** Background refresh defaults to `10 req/hr` (`360s`, editable `0`–`60` in **Settings → Sync & API Quota**; `0` = manual only) with a live `X/30 req` rolling 1-hour counter (`0600` in `~/.config/omarchy/clockify-quota.json`, configurable `hourlyRequestLimit`) and automatic HTTP `429` backoff. Any timer or entry mutation that hits `429` is saved with frozen UTC timestamps in `~/.config/omarchy/clockify-pending.json` (`0600`), compacted locally (e.g., Start + Stop collapses to a single manual entry; Start + Discard cancels out), overlaid immediately onto the UI/totals, and synced FIFO automatically or via **Sync Now**.
 
 ## Install
 
@@ -56,7 +57,7 @@ Configurable in the bar settings panel or under the widget entry in `~/.config/o
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `refreshIntervalSec` | `45` | Background polling interval in seconds (`15`–`3600`) |
+| `refreshIntervalSec` | `360` | Fallback polling interval in seconds (`15`–`3600`; `360s` = `10 req/hr`; also tunable via **Auto-refresh / hr** in Settings) |
 | `hideWhenIdle` | `false` | Hide the bar pill when no timer is running |
 | `showTimerInBar` | `true` | Show live `H:MM:SS` beside the icon while timing |
 | `showTaskInBar` | `false` | Include the active task/description in the bar pill |
@@ -81,7 +82,8 @@ Direct CLI usage:
 ./clockify.py update-running --adjust-minutes 5
 ./clockify.py split-running --minutes-ago 5
 ./clockify.py add-manual --date today --start 09:00 --end 10:30 --description "Planning"
-./clockify.py set-config --time-step-min 1 --quick-step-min 5 --duration-format full --daily-target-hours 8 --weekly-target-hours 40
+./clockify.py set-config --time-step-min 1 --quick-step-min 5 --duration-format full --daily-target-hours 8 --weekly-target-hours 40 --refresh-per-hour 10 --hourly-limit 30
+./clockify.py sync-pending
 ./clockify.py export-csv --start-date 2026-11-01 --end-date 2026-11-30
 ```
 
@@ -97,7 +99,7 @@ omarchy plugin validate .
 ```bash
 omarchy plugin disable io.github.abdulrahmanhr.clockify
 omarchy plugin remove io.github.abdulrahmanhr.clockify
-rm -f ~/.config/omarchy/clockify.json ~/.config/omarchy/clockify-cache.json ~/.local/bin/clockify-ctl
+rm -f ~/.config/omarchy/clockify.json ~/.config/omarchy/clockify-cache.json ~/.config/omarchy/clockify-quota.json ~/.config/omarchy/clockify-pending.json ~/.local/bin/clockify-ctl
 ```
 
 ## License
